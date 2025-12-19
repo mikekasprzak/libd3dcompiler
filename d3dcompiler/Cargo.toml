@@ -1,0 +1,26 @@
+[package]
+name = "d3dcompiler"
+version = "0.1.0"
+edition = "2024"
+description = "Cross-platform wrapper for d3dcompiler_47.dll shader compiler"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+object = { version = "0.36", default-features = false, features = ["read_core", "pe", "std"] }
+libc = "0.2"
+uuid = { version = "1.0", features = ["v4"] }
+paste = "1.0"
+thiserror = "2"
+sha1 = "0.10"
+include_bytes_aligned = "0.2.0"
+d3dcompiler_proc = { path = "../d3dcompiler_proc" }
+
+[features]
+default = ["embed-dll"]
+# Enable to embed the DLL bytes directly in the binary
+embed-dll = []
+# Enable debug logging for reflection wrapper
+debug-logs = []
