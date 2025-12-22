@@ -1,9 +1,9 @@
 [package]
 name = "d3dcompiler"
-version = "0.1.0"
-edition = "2024"
 description = "Cross-platform wrapper for d3dcompiler_47.dll shader compiler"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]

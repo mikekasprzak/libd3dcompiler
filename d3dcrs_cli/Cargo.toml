@@ -1,0 +1,14 @@
+[package]
+name = "d3dcrs_cli"
+description = "Command-line tool for D3DCompiler operations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "d3dcrs"
+path = "src/main.rs"
+
+[dependencies]
+d3dcrs = { path = "../d3dcrs" }
+clap = { version = "4", features = ["derive"] }
