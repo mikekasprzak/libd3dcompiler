@@ -2,9 +2,9 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use d3dcrs::{
-    BlobPart, CompileBuilder, CompileFlags, DisassembleBuilder, PreprocessBuilder,
-    ShaderReflection, ShaderTarget, StripFlags, get_blob_part, get_debug_info, get_input_signature,
-    get_output_signature, set_blob_part, strip_shader,
+    BlobPart, CompileBuilder, CompileFlags, DisassembleBuilder, DisassembleFlags,
+    PreprocessBuilder, ShaderReflection, ShaderTarget, StripFlags, get_blob_part, get_debug_info,
+    get_input_signature, get_output_signature, set_blob_part, strip_shader,
 };
 use std::path::PathBuf;
 
@@ -53,6 +53,38 @@ enum Commands {
         /// Output file (default: stdout)
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Enable color-coded output
+        #[arg(long)]
+        color: bool,
+
+        /// Number each instruction
+        #[arg(short = 'n', long)]
+        instruction_numbering: bool,
+
+        /// Include byte offset for each instruction
+        #[arg(long)]
+        instruction_offset: bool,
+
+        /// Include instruction cycle counts
+        #[arg(long)]
+        instruction_cycle: bool,
+
+        /// Print default values for parameters
+        #[arg(long)]
+        default_values: bool,
+
+        /// Disable debug info in output
+        #[arg(long)]
+        no_debug: bool,
+
+        /// Output only instructions (no declarations)
+        #[arg(long)]
+        instruction_only: bool,
+
+        /// Print hex literals
+        #[arg(long)]
+        hex_literals: bool,
     },
 
     /// Preprocess HLSL source
@@ -299,11 +331,16 @@ fn compile_shader(
     Ok(())
 }
 
-fn disassemble_shader(input: PathBuf, output: Option<PathBuf>) -> Result<(), String> {
+fn disassemble_shader(
+    input: PathBuf,
+    output: Option<PathBuf>,
+    flags: DisassembleFlags,
+) -> Result<(), String> {
     let bytecode =
         std::fs::read(&input).map_err(|e| format!("Failed to read {}: {}", input.display(), e))?;
 
     let disasm = DisassembleBuilder::new(&bytecode)
+        .flags(flags)
         .disassemble()
         .map_err(|e| format!("{}", e))?;
 
@@ -631,7 +668,45 @@ fn main() {
             optimize,
             defines,
         } => compile_shader(input, entry, target, output, optimize, defines),
-        Commands::Disasm { input, output } => disassemble_shader(input, output),
+        Commands::Disasm {
+            input,
+            output,
+            color,
+            instruction_numbering,
+            instruction_offset,
+            instruction_cycle,
+            default_values,
+            no_debug,
+            instruction_only,
+            hex_literals,
+        } => {
+            let mut flags = DisassembleFlags::empty();
+            if color {
+                flags |= DisassembleFlags::ENABLE_COLOR_CODE;
+            }
+            if instruction_numbering {
+                flags |= DisassembleFlags::ENABLE_INSTRUCTION_NUMBERING;
+            }
+            if instruction_offset {
+                flags |= DisassembleFlags::ENABLE_INSTRUCTION_OFFSET;
+            }
+            if instruction_cycle {
+                flags |= DisassembleFlags::ENABLE_INSTRUCTION_CYCLE;
+            }
+            if default_values {
+                flags |= DisassembleFlags::ENABLE_DEFAULT_VALUE_PRINTS;
+            }
+            if no_debug {
+                flags |= DisassembleFlags::DISABLE_DEBUG_INFO;
+            }
+            if instruction_only {
+                flags |= DisassembleFlags::INSTRUCTION_ONLY;
+            }
+            if hex_literals {
+                flags |= DisassembleFlags::PRINT_HEX_LITERALS;
+            }
+            disassemble_shader(input, output, flags)
+        }
         Commands::Preprocess {
             input,
             output,
