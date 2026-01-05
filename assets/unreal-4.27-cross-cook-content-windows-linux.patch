@@ -1,0 +1,2145 @@
+From 9769ba55621af452344d293b66bac6febd463b3c Mon Sep 17 00:00:00 2001
+From: Truman Kilen <t@kilen.me>
+Date: Sun, 4 Jan 2026 17:38:21 -0600
+Subject: [PATCH] PATCH: Enable SM5/FXC shader compilation and cooking content
+ for Windows from Linux
+
+---
+ .../Config/Windows/DataDrivenPlatformInfo.ini |   2 +-
+ .../Private/DXCWrapper.cpp                    |  17 +-
+ .../Public/D3DShaderTypeDefs.h                | 540 ++++++++++++++++++
+ .../TargetPlatform/TargetPlatform.Build.cs    |   3 +
+ .../Private/D3DShaderCompiler.cpp             | 172 +++++-
+ .../Private/D3DShaderCompiler.inl             |  69 +--
+ .../Private/D3DShaderCompilerDXC.cpp          | 436 +++++++++++++-
+ .../Private/ShaderFormatD3D.cpp               |   2 +-
+ .../ShaderFormatD3D/Private/ShaderFormatD3D.h |   4 +
+ .../ShaderFormatD3D/ShaderFormatD3D.Build.cs  |  24 +-
+ .../Private/GenericWindowsTargetPlatform.h    |  10 +-
+ .../MainFrame/Private/Menus/MainMenu.cpp      |  21 +
+ .../ShaderCompileWorker.Build.cs              |  10 +
+ .../Platform/Linux/UEBuildLinux.cs            |  19 +
+ .../ShaderConductor/ShaderConductor.Build.cs  |   6 +
+ .../include/dxc/Support/WinAdapter.h          |  35 +-
+ 16 files changed, 1284 insertions(+), 86 deletions(-)
+ create mode 100644 Engine/Source/Developer/ShaderCompilerCommon/Public/D3DShaderTypeDefs.h
+
+diff --git a/Engine/Config/Windows/DataDrivenPlatformInfo.ini b/Engine/Config/Windows/DataDrivenPlatformInfo.ini
+index 209124fd1fef..139c8d0ec2d6 100644
+--- a/Engine/Config/Windows/DataDrivenPlatformInfo.ini
++++ b/Engine/Config/Windows/DataDrivenPlatformInfo.ini
+@@ -29,7 +29,7 @@ AutoSDKPath=
+ TutorialPath=SharingAndReleasing
+ Windows:bIsEnabled=true
+ Mac:bIsEnabled=false
+-Linux:bIsEnabled=false
++Linux:bIsEnabled=true
+ BinariesDirectoryName=Win64
+ IniPlatformName=Windows
+ bUsesHostCompiler=true
+diff --git a/Engine/Source/Developer/ShaderCompilerCommon/Private/DXCWrapper.cpp b/Engine/Source/Developer/ShaderCompilerCommon/Private/DXCWrapper.cpp
+index b9fc5ec88449..3f56e2e7fcf8 100644
+--- a/Engine/Source/Developer/ShaderCompilerCommon/Private/DXCWrapper.cpp
++++ b/Engine/Source/Developer/ShaderCompilerCommon/Private/DXCWrapper.cpp
+@@ -10,13 +10,26 @@ static TRefCountPtr<FDllHandle> GShaderConductorHandle;
+ 
+ FDllHandle::FDllHandle(const TCHAR* InFilename)
+ {
+-#if PLATFORM_WINDOWS
+ 	check(InFilename && *InFilename);
++#if PLATFORM_WINDOWS
+ 	FString ShaderConductorDir = FPaths::EngineDir() / TEXT("Binaries/ThirdParty/ShaderConductor/Win64");
+ 	FString ModulePath = ShaderConductorDir / InFilename;
++#elif PLATFORM_LINUX
++	FString ShaderConductorDir = FPaths::EngineDir() / TEXT("Binaries/ThirdParty/ShaderConductor/Linux/x86_64-unknown-linux-gnu");
++	// Convert Windows DLL name to Linux .so name
++	FString LibName = FString(InFilename);
++	LibName = LibName.Replace(TEXT(".dll"), TEXT(".so"));
++	if (!LibName.StartsWith(TEXT("lib")))
++	{
++		LibName = TEXT("lib") + LibName;
++	}
++	FString ModulePath = ShaderConductorDir / LibName;
++#else
++	FString ModulePath;
++	checkf(false, TEXT("DXC not supported on this platform"));
++#endif
+ 	Handle = FPlatformProcess::GetDllHandle(*ModulePath);
+ 	checkf(Handle, TEXT("Failed to load module: %s"), *ModulePath);
+-#endif
+ }
+ 
+ FDllHandle::~FDllHandle()
+diff --git a/Engine/Source/Developer/ShaderCompilerCommon/Public/D3DShaderTypeDefs.h b/Engine/Source/Developer/ShaderCompilerCommon/Public/D3DShaderTypeDefs.h
+new file mode 100644
+index 000000000000..4420d35df0c1
+--- /dev/null
++++ b/Engine/Source/Developer/ShaderCompilerCommon/Public/D3DShaderTypeDefs.h
+@@ -0,0 +1,540 @@
++// D3D shader types for non-Windows platforms (Linux cross-compilation).
++// Provides D3D enums, macros, and FXC reflection interfaces needed by the shader compiler.
++
++#pragma once
++
++#if !PLATFORM_WINDOWS
++
++#include <cstddef>
++
++//===----------------------------------------------------------------------===//
++// Windows COM types - guarded to avoid conflicts with DXC's WinAdapter.h
++//===----------------------------------------------------------------------===//
++
++#ifndef _HRESULT_DEFINED
++#define _HRESULT_DEFINED
++typedef signed int HRESULT;
++#endif
++
++#ifndef SUCCEEDED
++#define SUCCEEDED(hr) (((HRESULT)(hr)) >= 0)
++#endif
++
++#ifndef FAILED
++#define FAILED(hr) (((HRESULT)(hr)) < 0)
++#endif
++
++#ifndef S_OK
++#define S_OK ((HRESULT)0)
++#endif
++
++#ifndef E_FAIL
++#define E_FAIL (HRESULT)0x80004005
++#endif
++
++#ifndef _GUID_DEFINED
++#define _GUID_DEFINED
++struct GUID {
++	unsigned int   Data1;
++	unsigned short Data2;
++	unsigned short Data3;
++	unsigned char  Data4[8];
++};
++#endif
++typedef GUID IID;
++typedef const void* REFIID;
++
++struct D3D_SHADER_DATA
++{
++	const void* pBytecode;
++	SIZE_T BytecodeLength;
++};
++
++//===----------------------------------------------------------------------===//
++// D3D Enums (from d3dcommon.h)
++//===----------------------------------------------------------------------===//
++
++enum D3D_SHADER_INPUT_TYPE
++{
++	D3D_SIT_CBUFFER = 0,
++	D3D_SIT_TBUFFER = 1,
++	D3D_SIT_TEXTURE = 2,
++	D3D_SIT_SAMPLER = 3,
++	D3D_SIT_UAV_RWTYPED = 4,
++	D3D_SIT_STRUCTURED = 5,
++	D3D_SIT_UAV_RWSTRUCTURED = 6,
++	D3D_SIT_BYTEADDRESS = 7,
++	D3D_SIT_UAV_RWBYTEADDRESS = 8,
++	D3D_SIT_UAV_APPEND_STRUCTURED = 9,
++	D3D_SIT_UAV_CONSUME_STRUCTURED = 10,
++	D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER = 11,
++};
++
++#define D3D10_SIT_CBUFFER D3D_SIT_CBUFFER
++#define D3D10_SIT_TBUFFER D3D_SIT_TBUFFER
++#define D3D10_SIT_TEXTURE D3D_SIT_TEXTURE
++#define D3D10_SIT_SAMPLER D3D_SIT_SAMPLER
++#define D3D11_SIT_UAV_RWTYPED D3D_SIT_UAV_RWTYPED
++#define D3D11_SIT_STRUCTURED D3D_SIT_STRUCTURED
++#define D3D11_SIT_UAV_RWSTRUCTURED D3D_SIT_UAV_RWSTRUCTURED
++#define D3D11_SIT_BYTEADDRESS D3D_SIT_BYTEADDRESS
++#define D3D11_SIT_UAV_RWBYTEADDRESS D3D_SIT_UAV_RWBYTEADDRESS
++#define D3D11_SIT_UAV_APPEND_STRUCTURED D3D_SIT_UAV_APPEND_STRUCTURED
++#define D3D11_SIT_UAV_CONSUME_STRUCTURED D3D_SIT_UAV_CONSUME_STRUCTURED
++#define D3D11_SIT_UAV_RWSTRUCTURED_WITH_COUNTER D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER
++
++enum D3D_SHADER_VARIABLE_CLASS
++{
++	D3D_SVC_SCALAR = 0,
++	D3D_SVC_VECTOR = 1,
++	D3D_SVC_MATRIX_ROWS = 2,
++	D3D_SVC_MATRIX_COLUMNS = 3,
++	D3D_SVC_OBJECT = 4,
++	D3D_SVC_STRUCT = 5,
++	D3D_SVC_INTERFACE_CLASS = 6,
++	D3D_SVC_INTERFACE_POINTER = 7,
++};
++
++enum D3D_SHADER_VARIABLE_TYPE
++{
++	D3D_SVT_VOID = 0,
++	D3D_SVT_BOOL = 1,
++	D3D_SVT_INT = 2,
++	D3D_SVT_FLOAT = 3,
++	D3D_SVT_TEXTURE = 5,
++	D3D_SVT_TEXTURE1D = 6,
++	D3D_SVT_TEXTURE2D = 7,
++	D3D_SVT_TEXTURE3D = 8,
++	D3D_SVT_TEXTURECUBE = 9,
++	D3D_SVT_SAMPLER = 10,
++	D3D_SVT_UINT = 19,
++	D3D_SVT_DOUBLE = 39,
++};
++
++enum D3D_RESOURCE_RETURN_TYPE
++{
++	D3D_RETURN_TYPE_UNORM = 1,
++	D3D_RETURN_TYPE_SNORM = 2,
++	D3D_RETURN_TYPE_SINT = 3,
++	D3D_RETURN_TYPE_UINT = 4,
++	D3D_RETURN_TYPE_FLOAT = 5,
++	D3D_RETURN_TYPE_MIXED = 6,
++	D3D_RETURN_TYPE_DOUBLE = 7,
++	D3D_RETURN_TYPE_CONTINUED = 8,
++};
++
++enum D3D_SRV_DIMENSION
++{
++	D3D_SRV_DIMENSION_UNKNOWN = 0,
++	D3D_SRV_DIMENSION_BUFFER = 1,
++	D3D_SRV_DIMENSION_TEXTURE1D = 2,
++	D3D_SRV_DIMENSION_TEXTURE1DARRAY = 3,
++	D3D_SRV_DIMENSION_TEXTURE2D = 4,
++	D3D_SRV_DIMENSION_TEXTURE2DARRAY = 5,
++	D3D_SRV_DIMENSION_TEXTURE2DMS = 6,
++	D3D_SRV_DIMENSION_TEXTURE2DMSARRAY = 7,
++	D3D_SRV_DIMENSION_TEXTURE3D = 8,
++	D3D_SRV_DIMENSION_TEXTURECUBE = 9,
++	D3D_SRV_DIMENSION_TEXTURECUBEARRAY = 10,
++	D3D_SRV_DIMENSION_BUFFEREX = 11,
++};
++
++enum D3D_CBUFFER_TYPE
++{
++	D3D_CT_CBUFFER = 0,
++	D3D_CT_TBUFFER = 1,
++	D3D_CT_INTERFACE_POINTERS = 2,
++	D3D_CT_RESOURCE_BIND_INFO = 3,
++};
++
++enum D3D_NAME
++{
++	D3D_NAME_UNDEFINED = 0,
++	D3D_NAME_POSITION = 1,
++	D3D_NAME_CLIP_DISTANCE = 2,
++	D3D_NAME_CULL_DISTANCE = 3,
++	D3D_NAME_RENDER_TARGET_ARRAY_INDEX = 4,
++	D3D_NAME_VIEWPORT_ARRAY_INDEX = 5,
++	D3D_NAME_VERTEX_ID = 6,
++	D3D_NAME_PRIMITIVE_ID = 7,
++	D3D_NAME_INSTANCE_ID = 8,
++	D3D_NAME_IS_FRONT_FACE = 9,
++	D3D_NAME_SAMPLE_INDEX = 10,
++	D3D_NAME_FINAL_QUAD_EDGE_TESSFACTOR = 11,
++	D3D_NAME_FINAL_QUAD_INSIDE_TESSFACTOR = 12,
++	D3D_NAME_FINAL_TRI_EDGE_TESSFACTOR = 13,
++	D3D_NAME_FINAL_TRI_INSIDE_TESSFACTOR = 14,
++	D3D_NAME_FINAL_LINE_DETAIL_TESSFACTOR = 15,
++	D3D_NAME_FINAL_LINE_DENSITY_TESSFACTOR = 16,
++	D3D_NAME_TARGET = 64,
++	D3D_NAME_DEPTH = 65,
++	D3D_NAME_COVERAGE = 66,
++	D3D_NAME_DEPTH_GREATER_EQUAL = 67,
++	D3D_NAME_DEPTH_LESS_EQUAL = 68,
++};
++
++enum D3D_REGISTER_COMPONENT_TYPE
++{
++	D3D_REGISTER_COMPONENT_UNKNOWN = 0,
++	D3D_REGISTER_COMPONENT_UINT32 = 1,
++	D3D_REGISTER_COMPONENT_SINT32 = 2,
++	D3D_REGISTER_COMPONENT_FLOAT32 = 3,
++};
++
++enum D3D_MIN_PRECISION
++{
++	D3D_MIN_PRECISION_DEFAULT = 0,
++	D3D_MIN_PRECISION_FLOAT_16 = 1,
++	D3D_MIN_PRECISION_FLOAT_2_8 = 2,
++	D3D_MIN_PRECISION_SINT_16 = 4,
++	D3D_MIN_PRECISION_UINT_16 = 5,
++	D3D_MIN_PRECISION_ANY_16 = 0xF0,
++	D3D_MIN_PRECISION_ANY_10 = 0xF1,
++};
++
++enum D3D_PRIMITIVE_TOPOLOGY
++{
++	D3D_PRIMITIVE_TOPOLOGY_UNDEFINED = 0,
++	D3D_PRIMITIVE_TOPOLOGY_POINTLIST = 1,
++	D3D_PRIMITIVE_TOPOLOGY_LINELIST = 2,
++	D3D_PRIMITIVE_TOPOLOGY_LINESTRIP = 3,
++	D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST = 4,
++	D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP = 5,
++};
++
++enum D3D_PRIMITIVE
++{
++	D3D_PRIMITIVE_UNDEFINED = 0,
++	D3D_PRIMITIVE_POINT = 1,
++	D3D_PRIMITIVE_LINE = 2,
++	D3D_PRIMITIVE_TRIANGLE = 3,
++	D3D_PRIMITIVE_LINE_ADJ = 6,
++	D3D_PRIMITIVE_TRIANGLE_ADJ = 7,
++	D3D_PRIMITIVE_1_CONTROL_POINT_PATCH = 8,
++	D3D_PRIMITIVE_2_CONTROL_POINT_PATCH = 9,
++	D3D_PRIMITIVE_3_CONTROL_POINT_PATCH = 10,
++	D3D_PRIMITIVE_4_CONTROL_POINT_PATCH = 11,
++	D3D_PRIMITIVE_5_CONTROL_POINT_PATCH = 12,
++	D3D_PRIMITIVE_6_CONTROL_POINT_PATCH = 13,
++};
++
++enum D3D_TESSELLATOR_OUTPUT_PRIMITIVE
++{
++	D3D_TESSELLATOR_OUTPUT_UNDEFINED = 0,
++	D3D_TESSELLATOR_OUTPUT_POINT = 1,
++	D3D_TESSELLATOR_OUTPUT_LINE = 2,
++	D3D_TESSELLATOR_OUTPUT_TRIANGLE_CW = 3,
++	D3D_TESSELLATOR_OUTPUT_TRIANGLE_CCW = 4,
++};
++
++enum D3D_TESSELLATOR_PARTITIONING
++{
++	D3D_TESSELLATOR_PARTITIONING_UNDEFINED = 0,
++	D3D_TESSELLATOR_PARTITIONING_INTEGER = 1,
++	D3D_TESSELLATOR_PARTITIONING_POW2 = 2,
++	D3D_TESSELLATOR_PARTITIONING_FRACTIONAL_ODD = 3,
++	D3D_TESSELLATOR_PARTITIONING_FRACTIONAL_EVEN = 4,
++};
++
++enum D3D_TESSELLATOR_DOMAIN
++{
++	D3D_TESSELLATOR_DOMAIN_UNDEFINED = 0,
++	D3D_TESSELLATOR_DOMAIN_ISOLINE = 1,
++	D3D_TESSELLATOR_DOMAIN_TRI = 2,
++	D3D_TESSELLATOR_DOMAIN_QUAD = 3,
++};
++
++enum D3D_FEATURE_LEVEL
++{
++	D3D_FEATURE_LEVEL_9_1 = 0x9100,
++	D3D_FEATURE_LEVEL_9_2 = 0x9200,
++	D3D_FEATURE_LEVEL_9_3 = 0x9300,
++	D3D_FEATURE_LEVEL_10_0 = 0xa000,
++	D3D_FEATURE_LEVEL_10_1 = 0xa100,
++	D3D_FEATURE_LEVEL_11_0 = 0xb000,
++	D3D_FEATURE_LEVEL_11_1 = 0xb100,
++	D3D_FEATURE_LEVEL_12_0 = 0xc000,
++	D3D_FEATURE_LEVEL_12_1 = 0xc100,
++};
++
++enum D3D_INTERPOLATION_MODE
++{
++	D3D_INTERPOLATION_UNDEFINED = 0,
++	D3D_INTERPOLATION_CONSTANT = 1,
++	D3D_INTERPOLATION_LINEAR = 2,
++	D3D_INTERPOLATION_LINEAR_CENTROID = 3,
++	D3D_INTERPOLATION_LINEAR_NOPERSPECTIVE = 4,
++	D3D_INTERPOLATION_LINEAR_NOPERSPECTIVE_CENTROID = 5,
++	D3D_INTERPOLATION_LINEAR_SAMPLE = 6,
++	D3D_INTERPOLATION_LINEAR_NOPERSPECTIVE_SAMPLE = 7,
++};
++
++enum D3D_PARAMETER_FLAGS
++{
++	D3D_PF_NONE = 0,
++	D3D_PF_IN = 0x1,
++	D3D_PF_OUT = 0x2,
++};
++
++//===----------------------------------------------------------------------===//
++// D3D Compiler Flags (from D3Dcompiler.h)
++//===----------------------------------------------------------------------===//
++
++#define D3DCOMPILE_DEBUG                          (1 << 0)
++#define D3DCOMPILE_SKIP_VALIDATION                (1 << 1)
++#define D3DCOMPILE_SKIP_OPTIMIZATION              (1 << 2)
++#define D3DCOMPILE_PACK_MATRIX_ROW_MAJOR          (1 << 3)
++#define D3DCOMPILE_PACK_MATRIX_COLUMN_MAJOR       (1 << 4)
++#define D3DCOMPILE_AVOID_FLOW_CONTROL             (1 << 9)
++#define D3DCOMPILE_PREFER_FLOW_CONTROL            (1 << 10)
++#define D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY (1 << 12)
++#define D3DCOMPILE_OPTIMIZATION_LEVEL0            (1 << 14)
++#define D3DCOMPILE_OPTIMIZATION_LEVEL1            0
++#define D3DCOMPILE_OPTIMIZATION_LEVEL2            ((1 << 14) | (1 << 15))
++#define D3DCOMPILE_OPTIMIZATION_LEVEL3            (1 << 15)
++#define D3DCOMPILE_WARNINGS_ARE_ERRORS            (1 << 18)
++
++#define D3D10_SHADER_DEBUG                          D3DCOMPILE_DEBUG
++#define D3D10_SHADER_SKIP_VALIDATION                D3DCOMPILE_SKIP_VALIDATION
++#define D3D10_SHADER_SKIP_OPTIMIZATION              D3DCOMPILE_SKIP_OPTIMIZATION
++#define D3D10_SHADER_PACK_MATRIX_ROW_MAJOR          D3DCOMPILE_PACK_MATRIX_ROW_MAJOR
++#define D3D10_SHADER_PACK_MATRIX_COLUMN_MAJOR       D3DCOMPILE_PACK_MATRIX_COLUMN_MAJOR
++#define D3D10_SHADER_AVOID_FLOW_CONTROL             D3DCOMPILE_AVOID_FLOW_CONTROL
++#define D3D10_SHADER_PREFER_FLOW_CONTROL            D3DCOMPILE_PREFER_FLOW_CONTROL
++#define D3D10_SHADER_ENABLE_BACKWARDS_COMPATIBILITY D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY
++#define D3D10_SHADER_OPTIMIZATION_LEVEL0            D3DCOMPILE_OPTIMIZATION_LEVEL0
++#define D3D10_SHADER_OPTIMIZATION_LEVEL1            D3DCOMPILE_OPTIMIZATION_LEVEL1
++#define D3D10_SHADER_OPTIMIZATION_LEVEL2            D3DCOMPILE_OPTIMIZATION_LEVEL2
++#define D3D10_SHADER_OPTIMIZATION_LEVEL3            D3DCOMPILE_OPTIMIZATION_LEVEL3
++
++#define D3D10_SVF_USED 0x2
++#define D3D_SVF_USED D3D10_SVF_USED
++
++#define D3DCOMPILER_STRIP_REFLECTION_DATA 0x00000001
++#define D3DCOMPILER_STRIP_DEBUG_INFO      0x00000002
++#define D3DCOMPILER_STRIP_TEST_BLOBS      0x00000004
++
++#define MAX_SRVS 128
++#define MAX_SAMPLERS 16
++#define MAX_UAVS 64
++#define MAX_CBS 14
++
++//===----------------------------------------------------------------------===//
++// FXC / d3dcompiler API types (from d3dcompiler.h, d3d11shader.h)
++//===----------------------------------------------------------------------===//
++
++struct D3D_SHADER_MACRO
++{
++	const char* Name;
++	const char* Definition;
++};
++
++struct ID3DBlob
++{
++	virtual long QueryInterface(REFIID riid, void** ppvObject) = 0;
++	virtual unsigned long AddRef() = 0;
++	virtual unsigned long Release() = 0;
++	virtual void* GetBufferPointer() = 0;
++	virtual SIZE_T GetBufferSize() = 0;
++};
++
++enum D3D_INCLUDE_TYPE { D3D_INCLUDE_LOCAL = 0, D3D_INCLUDE_SYSTEM = 1 };
++
++struct ID3DInclude
++{
++	virtual ~ID3DInclude() {}
++	virtual long Open(D3D_INCLUDE_TYPE IncludeType, const char* pFileName, const void* pParentData, const void** ppData, unsigned int* pBytes) = 0;
++	virtual long Close(const void* pData) = 0;
++};
++
++struct D3D11_SHADER_INPUT_BIND_DESC
++{
++	const char*              Name;
++	D3D_SHADER_INPUT_TYPE    Type;
++	unsigned int             BindPoint;
++	unsigned int             BindCount;
++	unsigned int             uFlags;
++	D3D_RESOURCE_RETURN_TYPE ReturnType;
++	D3D_SRV_DIMENSION        Dimension;
++	unsigned int             NumSamples;
++};
++
++struct D3D11_SHADER_BUFFER_DESC
++{
++	const char*      Name;
++	D3D_CBUFFER_TYPE Type;
++	unsigned int     Variables;
++	unsigned int     Size;
++	unsigned int     uFlags;
++};
++
++struct D3D11_SHADER_VARIABLE_DESC
++{
++	const char*  Name;
++	unsigned int StartOffset;
++	unsigned int Size;
++	unsigned int uFlags;
++	void*        DefaultValue;
++	unsigned int StartTexture;
++	unsigned int TextureSize;
++	unsigned int StartSampler;
++	unsigned int SamplerSize;
++};
++
++struct D3D11_SHADER_TYPE_DESC
++{
++	D3D_SHADER_VARIABLE_CLASS Class;
++	D3D_SHADER_VARIABLE_TYPE  Type;
++	unsigned int              Rows;
++	unsigned int              Columns;
++	unsigned int              Elements;
++	unsigned int              Members;
++	unsigned int              Offset;
++	const char*               Name;
++};
++
++struct D3D11_SIGNATURE_PARAMETER_DESC
++{
++	const char*              SemanticName;
++	unsigned int             SemanticIndex;
++	unsigned int             Register;
++	D3D_NAME                 SystemValueType;
++	D3D_REGISTER_COMPONENT_TYPE ComponentType;
++	unsigned char            Mask;
++	unsigned char            ReadWriteMask;
++	unsigned int             Stream;
++};
++
++struct D3D11_SHADER_DESC
++{
++	unsigned int Version;
++	const char* Creator;
++	unsigned int Flags;
++	unsigned int ConstantBuffers;
++	unsigned int BoundResources;
++	unsigned int InputParameters;
++	unsigned int OutputParameters;
++	unsigned int InstructionCount;
++	unsigned int TempRegisterCount;
++	unsigned int TempArrayCount;
++	unsigned int DefCount;
++	unsigned int DclCount;
++	unsigned int TextureNormalInstructions;
++	unsigned int TextureLoadInstructions;
++	unsigned int TextureCompInstructions;
++	unsigned int TextureBiasInstructions;
++	unsigned int TextureGradientInstructions;
++	unsigned int FloatInstructionCount;
++	unsigned int IntInstructionCount;
++	unsigned int UintInstructionCount;
++	unsigned int StaticFlowControlCount;
++	unsigned int DynamicFlowControlCount;
++	unsigned int MacroInstructionCount;
++	unsigned int ArrayInstructionCount;
++	unsigned int CutInstructionCount;
++	unsigned int EmitInstructionCount;
++	D3D_PRIMITIVE_TOPOLOGY GSOutputTopology;
++	unsigned int GSMaxOutputVertexCount;
++	D3D_PRIMITIVE InputPrimitive;
++	unsigned int PatchConstantParameters;
++	unsigned int cGSInstanceCount;
++	unsigned int cControlPoints;
++	D3D_TESSELLATOR_OUTPUT_PRIMITIVE HSOutputPrimitive;
++	D3D_TESSELLATOR_PARTITIONING HSPartitioning;
++	D3D_TESSELLATOR_DOMAIN TessellatorDomain;
++	unsigned int cBarrierInstructions;
++	unsigned int cInterlockedInstructions;
++	unsigned int cTextureStoreInstructions;
++};
++
++struct ID3D11ShaderReflectionType;
++struct ID3D11ShaderReflectionVariable;
++struct ID3D11ShaderReflectionConstantBuffer;
++
++struct ID3D11ShaderReflectionType
++{
++	virtual long GetDesc(D3D11_SHADER_TYPE_DESC* pDesc) = 0;
++	virtual ID3D11ShaderReflectionType* GetMemberTypeByIndex(unsigned int Index) = 0;
++	virtual ID3D11ShaderReflectionType* GetMemberTypeByName(const char* Name) = 0;
++	virtual const char* GetMemberTypeName(unsigned int Index) = 0;
++	virtual long IsEqual(ID3D11ShaderReflectionType* pType) = 0;
++	virtual ID3D11ShaderReflectionType* GetSubType() = 0;
++	virtual ID3D11ShaderReflectionType* GetBaseClass() = 0;
++	virtual unsigned int GetNumInterfaces() = 0;
++	virtual ID3D11ShaderReflectionType* GetInterfaceByIndex(unsigned int uIndex) = 0;
++	virtual long IsOfType(ID3D11ShaderReflectionType* pType) = 0;
++	virtual long ImplementsInterface(ID3D11ShaderReflectionType* pBase) = 0;
++};
++
++struct ID3D11ShaderReflectionVariable
++{
++	virtual long GetDesc(D3D11_SHADER_VARIABLE_DESC* pDesc) = 0;
++	virtual ID3D11ShaderReflectionType* GetType() = 0;
++	virtual ID3D11ShaderReflectionConstantBuffer* GetBuffer() = 0;
++	virtual unsigned int GetInterfaceSlot(unsigned int uArrayIndex) = 0;
++};
++
++struct ID3D11ShaderReflectionConstantBuffer
++{
++	virtual long GetDesc(D3D11_SHADER_BUFFER_DESC* pDesc) = 0;
++	virtual ID3D11ShaderReflectionVariable* GetVariableByIndex(unsigned int Index) = 0;
++	virtual ID3D11ShaderReflectionVariable* GetVariableByName(const char* Name) = 0;
++};
++
++struct ID3D11ShaderReflection
++{
++	virtual long QueryInterface(REFIID riid, void** ppvObject) = 0;
++	virtual unsigned long AddRef() = 0;
++	virtual unsigned long Release() = 0;
++	virtual long GetDesc(D3D11_SHADER_DESC* pDesc) = 0;
++	virtual ID3D11ShaderReflectionConstantBuffer* GetConstantBufferByIndex(unsigned int Index) = 0;
++	virtual ID3D11ShaderReflectionConstantBuffer* GetConstantBufferByName(const char* Name) = 0;
++	virtual long GetResourceBindingDesc(unsigned int ResourceIndex, D3D11_SHADER_INPUT_BIND_DESC* pDesc) = 0;
++	virtual long GetInputParameterDesc(unsigned int ParameterIndex, D3D11_SIGNATURE_PARAMETER_DESC* pDesc) = 0;
++	virtual long GetOutputParameterDesc(unsigned int ParameterIndex, D3D11_SIGNATURE_PARAMETER_DESC* pDesc) = 0;
++	virtual long GetPatchConstantParameterDesc(unsigned int ParameterIndex, D3D11_SIGNATURE_PARAMETER_DESC* pDesc) = 0;
++	virtual ID3D11ShaderReflectionVariable* GetVariableByName(const char* Name) = 0;
++	virtual long GetResourceBindingDescByName(const char* Name, D3D11_SHADER_INPUT_BIND_DESC* pDesc) = 0;
++	virtual unsigned int GetMovInstructionCount() = 0;
++	virtual unsigned int GetMovcInstructionCount() = 0;
++	virtual unsigned int GetConversionInstructionCount() = 0;
++	virtual unsigned int GetBitwiseInstructionCount() = 0;
++	virtual D3D_PRIMITIVE GetGSInputPrimitive() = 0;
++	virtual int IsSampleFrequencyShader() = 0;
++	virtual unsigned int GetNumInterfaceSlots() = 0;
++	virtual long GetMinFeatureLevel(D3D_FEATURE_LEVEL* pLevel) = 0;
++	virtual unsigned int GetThreadGroupSize(unsigned int* pSizeX, unsigned int* pSizeY, unsigned int* pSizeZ) = 0;
++	virtual unsigned long long GetRequiresFlags() = 0;
++};
++
++typedef long (*pD3DCompile)(const void*, SIZE_T, const char*, const D3D_SHADER_MACRO*, ID3DInclude*, const char*, const char*, unsigned int, unsigned int, ID3DBlob**, ID3DBlob**);
++typedef long (*pD3DReflect)(const void*, SIZE_T, const void*, void**);
++typedef long (*pD3DDisassemble)(const void*, SIZE_T, unsigned int, const char*, ID3DBlob**);
++typedef long (*pD3DStripShader)(const void*, SIZE_T, unsigned int, ID3DBlob**);
++
++//===----------------------------------------------------------------------===//
++// FD3D11ShaderResourceTable (from D3D11ShaderResources.h)
++//===----------------------------------------------------------------------===//
++
++#include "ShaderCore.h"
++
++struct FD3D11ShaderResourceTable : public FBaseShaderResourceTable
++{
++	TArray<uint32> TextureMap;
++
++	friend bool operator==(const FD3D11ShaderResourceTable& A, const FD3D11ShaderResourceTable& B)
++	{
++		const FBaseShaderResourceTable& BaseA = A;
++		const FBaseShaderResourceTable& BaseB = B;
++		return BaseA == BaseB && (FMemory::Memcmp(A.TextureMap.GetData(), B.TextureMap.GetData(), A.TextureMap.GetTypeSize()*A.TextureMap.Num()) == 0);
++	}
++};
++
++inline FArchive& operator<<(FArchive& Ar, FD3D11ShaderResourceTable& SRT)
++{
++	Ar << static_cast<FBaseShaderResourceTable&>(SRT);
++	Ar << SRT.TextureMap;
++	return Ar;
++}
++
++#endif // !PLATFORM_WINDOWS
+diff --git a/Engine/Source/Developer/TargetPlatform/TargetPlatform.Build.cs b/Engine/Source/Developer/TargetPlatform/TargetPlatform.Build.cs
+index 061087f1b74e..7e13c59fa75e 100644
+--- a/Engine/Source/Developer/TargetPlatform/TargetPlatform.Build.cs
++++ b/Engine/Source/Developer/TargetPlatform/TargetPlatform.Build.cs
+@@ -89,6 +89,9 @@ public class TargetPlatform : ModuleRules
+ 			}
+ 			else if (Target.IsInPlatformGroup(UnrealPlatformGroup.Linux))
+ 			{
++				// ShaderFormatD3D for cross-cooking Windows shaders on Linux
++				DynamicallyLoadedModuleNames.Add("ShaderFormatD3D");
++
+ 				DynamicallyLoadedModuleNames.Add("TextureFormatDXT");
+ 				DynamicallyLoadedModuleNames.Add("TextureFormatPVR");
+ 				DynamicallyLoadedModuleNames.Add("TextureFormatASTC");
+diff --git a/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/D3DShaderCompiler.cpp b/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/D3DShaderCompiler.cpp
+index 68555401033d..984d5454a40f 100644
+--- a/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/D3DShaderCompiler.cpp
++++ b/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/D3DShaderCompiler.cpp
+@@ -3,8 +3,12 @@
+ #include "ShaderFormatD3D.h"
+ #include "ShaderPreprocessor.h"
+ #include "ShaderCompilerCommon.h"
++#if PLATFORM_WINDOWS
+ #include "D3D11ShaderResources.h"
+ #include "D3D12RHI.h"
++#elif PLATFORM_LINUX
++#include <dlfcn.h>  // For dlopen, dlsym, dlclose
++#endif
+ #include "Misc/Paths.h"
+ #include "Misc/FileHelper.h"
+ #include "HAL/FileManager.h"
+@@ -18,9 +22,7 @@ DEFINE_LOG_CATEGORY_STATIC(LogD3D11ShaderCompiler, Log, All);
+ // D3D headers.
+ #define D3D_OVERLOADS 1
+ 
+-// D3D doesn't define a mask for this, so we do so here
+-#define SHADER_OPTIMIZATION_LEVEL_MASK (D3D10_SHADER_OPTIMIZATION_LEVEL0 | D3D10_SHADER_OPTIMIZATION_LEVEL1 | D3D10_SHADER_OPTIMIZATION_LEVEL2 | D3D10_SHADER_OPTIMIZATION_LEVEL3)
+-
++#if PLATFORM_WINDOWS
+ // Disable macro redefinition warning for compatibility with Windows SDK 8+
+ #pragma warning(push)
+ #pragma warning(disable : 4005)	// macro redefinition
+@@ -32,13 +34,22 @@ DEFINE_LOG_CATEGORY_STATIC(LogD3D11ShaderCompiler, Log, All);
+ #include "Windows/HideWindowsPlatformTypes.h"
+ #undef DrawText
+ 
+-#include "D3DShaderCompiler.inl"
+-
+ #pragma warning(pop)
++#else
++// Cross-platform D3D type definitions for Linux cross-compilation
++#include "D3DShaderTypeDefs.h"
++#endif // PLATFORM_WINDOWS
++
++// D3D doesn't define a mask for this, so we do so here
++#define SHADER_OPTIMIZATION_LEVEL_MASK (D3D10_SHADER_OPTIMIZATION_LEVEL0 | D3D10_SHADER_OPTIMIZATION_LEVEL1 | D3D10_SHADER_OPTIMIZATION_LEVEL2 | D3D10_SHADER_OPTIMIZATION_LEVEL3)
++
++#include "D3DShaderCompiler.inl"
+ 
+ static const uint32 GD3DMaximumNumUAVs = 8; // Limit for feature level 11.0
+ 
+ int32 GD3DAllowRemoveUnused = 0;
++
++#if PLATFORM_WINDOWS || PLATFORM_LINUX
+ static int32 GD3DCheckForDoubles = 1;
+ static int32 GD3DDumpAMDCodeXLFile = 0;
+ 
+@@ -66,7 +77,7 @@ static void D3D11FilterShaderCompileWarnings(const FString& CompileWarnings, TAr
+ 	TArray<FString> WarningArray;
+ 	FString OutWarningString = TEXT("");
+ 	CompileWarnings.ParseIntoArray(WarningArray, TEXT("\n"), true);
+-	
++
+ 	//go through each warning line
+ 	for (int32 WarningIndex = 0; WarningIndex < WarningArray.Num(); WarningIndex++)
+ 	{
+@@ -80,6 +91,7 @@ static void D3D11FilterShaderCompileWarnings(const FString& CompileWarnings, TAr
+ 		}
+ 	}
+ }
++#endif // PLATFORM_WINDOWS || PLATFORM_LINUX (FXC helpers)
+ 
+ // @return 0 if not recognized
+ static const TCHAR* GetShaderProfileName(FShaderTarget Target, bool bForceSM6)
+@@ -135,6 +147,7 @@ static const TCHAR* GetShaderProfileName(FShaderTarget Target, bool bForceSM6)
+ 	return NULL;
+ }
+ 
++#if PLATFORM_WINDOWS
+ /**
+  * D3D11CreateShaderCompileCommandLine - takes shader parameters used to compile with the DX11
+  * compiler and returns an fxc command to compile from the command line
+@@ -263,6 +276,7 @@ static FString D3D11CreateShaderCompileCommandLine(
+ 		"GOTO END\n)\n)\n");
+ 	return BatchFileHeader + FXCCommandline + TEXT("\n:END\nREM\n");
+ }
++#endif // PLATFORM_WINDOWS (D3D11CreateShaderCompileCommandLine)
+ 
+ 
+ // Validate that we are not going over to maximum amount of resource bindings support by the default root signature on DX12
+@@ -299,16 +313,17 @@ bool ValidateResourceCounts(uint32 NumSRVs, uint32 NumSamplers, uint32 NumUAVs,
+ 	return true;
+ }
+ 
++#if PLATFORM_WINDOWS
+ /** Creates a batch file string to call the AMD shader analyzer. */
+ static FString CreateAMDCodeXLCommandLine(
+-	const FString& ShaderPath, 
+-	const TCHAR* EntryFunction, 
++	const FString& ShaderPath,
++	const TCHAR* EntryFunction,
+ 	const TCHAR* ShaderProfile,
+ 	uint32 DXFlags
+ 	)
+ {
+ 	// Hardcoded to the default install path since there's no Env variable or addition to PATH
+-	FString Commandline = FString(TEXT("\"C:\\Program Files (x86)\\AMD\\CodeXL\\CodeXLAnalyzer.exe\" -c Pitcairn")) 
++	FString Commandline = FString(TEXT("\"C:\\Program Files (x86)\\AMD\\CodeXL\\CodeXLAnalyzer.exe\" -c Pitcairn"))
+ 		+ TEXT(" -f ") + EntryFunction
+ 		+ TEXT(" -s HLSL")
+ 		+ TEXT(" -p ") + ShaderProfile
+@@ -334,6 +349,9 @@ typedef HRESULT(WINAPI *pD3DStripShader)
+ 	 __in SIZE_T     BytecodeLength,
+ 	 __in UINT       uStripFlags,
+ 	__out ID3DBlob** ppStrippedBlob);
++#endif // PLATFORM_WINDOWS (AMD CodeXL and Windows typedefs)
++
++#if PLATFORM_WINDOWS || PLATFORM_LINUX
+ 
+ #define DEFINE_GUID_FOR_CURRENT_COMPILER(name, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8) \
+ 	static const GUID name = { l, w1, w2, { b1, b2,  b3,  b4,  b5,  b6,  b7,  b8 } }
+@@ -343,6 +361,67 @@ typedef HRESULT(WINAPI *pD3DStripShader)
+ // look for IID_ID3D11ShaderReflection in d3d11shader.h for the SDK matching the compiler DLL.
+ DEFINE_GUID_FOR_CURRENT_COMPILER(IID_ID3D11ShaderReflectionForCurrentCompiler, 0x8d536ca1, 0x0cca, 0x4956, 0xa8, 0x37, 0x78, 0x69, 0x63, 0x75, 0x55, 0x84);
+ 
++#if PLATFORM_LINUX
++/**
++ * GetD3DCompilerFuncs - Linux version using dlopen/dlsym
++ * Loads libd3dcompiler.so from Engine/Binaries/ThirdParty/D3DCompiler/Linux/
++ */
++static bool GetD3DCompilerFuncs(const FString& NewCompilerPath, pD3DCompile* OutD3DCompile,
++	pD3DReflect* OutD3DReflect, pD3DDisassemble* OutD3DDisassemble, pD3DStripShader* OutD3DStripShader)
++{
++	static void* CompilerSO = nullptr;
++	static bool bTriedLoading = false;
++
++	if (!bTriedLoading)
++	{
++		bTriedLoading = true;
++
++		// Try loading from the ThirdParty location first
++		FString LibPath = FPaths::EngineDir() / TEXT("Binaries/ThirdParty/D3DCompiler/Linux/libd3dcompiler.so");
++		CompilerSO = dlopen(TCHAR_TO_UTF8(*LibPath), RTLD_NOW);
++
++		if (!CompilerSO)
++		{
++			// Try system path as fallback
++			CompilerSO = dlopen("libd3dcompiler.so", RTLD_NOW);
++		}
++
++		if (!CompilerSO)
++		{
++			const char* Error = dlerror();
++			UE_LOG(LogD3D11ShaderCompiler, Warning, TEXT("Failed to load libd3dcompiler.so: %s"), Error ? ANSI_TO_TCHAR(Error) : TEXT("unknown error"));
++		}
++		else
++		{
++			UE_LOG(LogD3D11ShaderCompiler, Log, TEXT("Loaded libd3dcompiler.so for FXC shader compilation"));
++		}
++	}
++
++	if (CompilerSO)
++	{
++		*OutD3DCompile = (pD3DCompile)dlsym(CompilerSO, "D3DCompile");
++		*OutD3DReflect = (pD3DReflect)dlsym(CompilerSO, "D3DReflect");
++		*OutD3DDisassemble = (pD3DDisassemble)dlsym(CompilerSO, "D3DDisassemble");
++		*OutD3DStripShader = (pD3DStripShader)dlsym(CompilerSO, "D3DStripShader");
++
++		if (*OutD3DCompile && *OutD3DReflect)
++		{
++			return true;
++		}
++		else
++		{
++			UE_LOG(LogD3D11ShaderCompiler, Warning, TEXT("libd3dcompiler.so missing required functions (D3DCompile=%p, D3DReflect=%p)"),
++				*OutD3DCompile, *OutD3DReflect);
++		}
++	}
++
++	*OutD3DCompile = nullptr;
++	*OutD3DReflect = nullptr;
++	*OutD3DDisassemble = nullptr;
++	*OutD3DStripShader = nullptr;
++	return false;
++}
++#else // PLATFORM_WINDOWS
+ /**
+  * GetD3DCompilerFuncs - gets function pointers from the dll at NewCompilerPath
+  * @param OutD3DCompile - function pointer for D3DCompile (0 if not found)
+@@ -400,24 +479,26 @@ static bool GetD3DCompilerFuncs(const FString& NewCompilerPath, pD3DCompile* Out
+ 	*OutD3DStripShader = &D3DStripShader;
+ 	return false;
+ }
++#endif // PLATFORM_LINUX vs PLATFORM_WINDOWS
+ 
+-static HRESULT D3DCompileWrapper(
++static long D3DCompileWrapper(
+ 	pD3DCompile				D3DCompileFunc,
+ 	bool&					bException,
+-	LPCVOID					pSrcData,
++	const void*				pSrcData,
+ 	SIZE_T					SrcDataSize,
+-	LPCSTR					pFileName,
+-	CONST D3D_SHADER_MACRO*	pDefines,
++	const char*				pFileName,
++	const D3D_SHADER_MACRO*	pDefines,
+ 	ID3DInclude*			pInclude,
+-	LPCSTR					pEntrypoint,
+-	LPCSTR					pTarget,
++	const char*				pEntrypoint,
++	const char*				pTarget,
+ 	uint32					Flags1,
+ 	uint32					Flags2,
+ 	ID3DBlob**				ppCode,
+ 	ID3DBlob**				ppErrorMsgs
+ 	)
+ {
+-#if !PLATFORM_SEH_EXCEPTIONS_DISABLED
++	bException = false;
++#if !PLATFORM_SEH_EXCEPTIONS_DISABLED && PLATFORM_WINDOWS
+ 	__try
+ #endif
+ 	{
+@@ -435,7 +516,7 @@ static HRESULT D3DCompileWrapper(
+ 			ppErrorMsgs
+ 		);
+ 	}
+-#if !PLATFORM_SEH_EXCEPTIONS_DISABLED
++#if !PLATFORM_SEH_EXCEPTIONS_DISABLED && PLATFORM_WINDOWS
+ 	__except( EXCEPTION_EXECUTE_HANDLER )
+ 	{
+ 		GSCWErrorCode = ESCWErrorCode::CrashInsidePlatformCompiler;
+@@ -452,6 +533,7 @@ inline bool IsCompatibleBinding(const D3D11_SHADER_INPUT_BIND_DESC& BindDesc, ui
+ {
+ 	return true;
+ }
++#endif // PLATFORM_WINDOWS || PLATFORM_LINUX (FXC code)
+ 
+ bool DumpDebugShaderUSF(FString& PreprocessedShaderSource, const FShaderCompilerInput& Input)
+ {
+@@ -487,6 +569,7 @@ bool DumpDebugShaderUSF(FString& PreprocessedShaderSource, const FShaderCompiler
+ }
+ 
+ 
++#if PLATFORM_WINDOWS || PLATFORM_LINUX
+ // Generate the dumped usf file; call the D3D compiler, gather reflection information and generate the output data
+ bool CompileAndProcessD3DShaderFXC(FString& PreprocessedShaderSource, const FString& CompilerPath,
+ 	uint32 CompileFlags, const FShaderCompilerInput& Input, FString& EntryPointName,
+@@ -500,6 +583,7 @@ bool CompileAndProcessD3DShaderFXC(FString& PreprocessedShaderSource, const FStr
+ 	FString DisasmFilename;
+ 	if (bDumpDebugInfo)
+ 	{
++#if PLATFORM_WINDOWS
+ 		FString BatchFileContents;
+ 		FString Filename = Input.GetSourceFilename();
+ 		BatchFileContents = D3D11CreateShaderCompileCommandLine(Filename, *EntryPointName, ShaderProfile, CompileFlags, Output);
+@@ -511,6 +595,7 @@ bool CompileAndProcessD3DShaderFXC(FString& PreprocessedShaderSource, const FStr
+ 		}
+ 
+ 		FFileHelper::SaveStringToFile(BatchFileContents, *(Input.DumpDebugInfoPath / TEXT("CompileFXC.bat")));
++#endif
+ 
+ 		if (Input.bGenerateDirectCompileFile)
+ 		{
+@@ -645,8 +730,13 @@ bool CompileAndProcessD3DShaderFXC(FString& PreprocessedShaderSource, const FStr
+ 
+ 			// IID_ID3D11ShaderReflectionForCurrentCompiler is defined in this file and needs to match the IID from the dll in CompilerPath
+ 			// if the function pointers from that dll are being used
++#if PLATFORM_WINDOWS
+ 			const IID ShaderReflectionInterfaceID = bCompilerPathFunctionsUsed ? IID_ID3D11ShaderReflectionForCurrentCompiler : IID_ID3D11ShaderReflection;
+ 			Result = D3DReflectFunc(Shader->GetBufferPointer(), Shader->GetBufferSize(), ShaderReflectionInterfaceID, (void**)&Reflector);
++#else
++			// On Linux, REFIID is const void*, so pass pointer to the IID
++			Result = D3DReflectFunc(Shader->GetBufferPointer(), Shader->GetBufferSize(), &IID_ID3D11ShaderReflectionForCurrentCompiler, (void**)&Reflector);
++#endif
+ 			if (FAILED(Result))
+ 			{
+ 				UE_LOG(LogD3D11ShaderCompiler, Fatal, TEXT("D3DReflect failed: Result=%08x"), Result);
+@@ -835,15 +925,52 @@ bool CompileAndProcessD3DShaderFXC(FString& PreprocessedShaderSource, const FStr
+ 
+ 	return SUCCEEDED(Result);
+ }
++#endif // PLATFORM_WINDOWS || PLATFORM_LINUX (CompileAndProcessD3DShaderFXC)
++
++// Check if FXC (libd3dcompiler) is available on Linux
++#if PLATFORM_LINUX
++static bool IsLinuxFXCAvailable()
++{
++	static int32 CachedResult = -1;
++	if (CachedResult < 0)
++	{
++		pD3DCompile D3DCompileFunc = nullptr;
++		pD3DReflect D3DReflectFunc = nullptr;
++		pD3DDisassemble D3DDisassembleFunc = nullptr;
++		pD3DStripShader D3DStripShaderFunc = nullptr;
++		CachedResult = GetD3DCompilerFuncs(TEXT(""), &D3DCompileFunc, &D3DReflectFunc, &D3DDisassembleFunc, &D3DStripShaderFunc) ? 1 : 0;
++	}
++	return CachedResult == 1;
++}
++#endif
+ 
+ void CompileD3DShader(const FShaderCompilerInput& Input, FShaderCompilerOutput& Output, FShaderCompilerDefinitions& AdditionalDefines, const FString& WorkingDirectory, ELanguage Language)
+ {
+ 	FString PreprocessedShaderSource;
+ 	const bool bIsRayTracingShader = Input.IsRayTracingShader();
++
++#if PLATFORM_WINDOWS
+ 	const bool bUseDXC = bIsRayTracingShader
+ 		|| Input.Environment.CompilerFlags.Contains(CFLAG_WaveOperations)
+ 		|| Input.Environment.CompilerFlags.Contains(CFLAG_ForceDXC);
+-	const TCHAR* ShaderProfile = GetShaderProfileName(Input.Target, bUseDXC);
++	// On Windows, only force SM6 for ray tracing or wave operations (FXC handles SM5)
++	const bool bForceSM6 = bIsRayTracingShader || Input.Environment.CompilerFlags.Contains(CFLAG_WaveOperations);
++#elif PLATFORM_LINUX
++	// On Linux, check if FXC library is available
++	const bool bLinuxFXCAvailable = IsLinuxFXCAvailable();
++	// Use DXC if FXC not available, or if ray tracing/wave ops are needed
++	const bool bUseDXC = !bLinuxFXCAvailable
++		|| bIsRayTracingShader
++		|| Input.Environment.CompilerFlags.Contains(CFLAG_WaveOperations)
++		|| Input.Environment.CompilerFlags.Contains(CFLAG_ForceDXC);
++	// Force SM6 only if FXC not available or ray tracing/wave ops needed
++	const bool bForceSM6 = !bLinuxFXCAvailable || bIsRayTracingShader || Input.Environment.CompilerFlags.Contains(CFLAG_WaveOperations);
++#else
++	// Other platforms: always use DXC with SM6
++	const bool bUseDXC = true;
++	const bool bForceSM6 = true;
++#endif
++	const TCHAR* ShaderProfile = GetShaderProfileName(Input.Target, bForceSM6);
+ 
+ 	if(!ShaderProfile)
+ 	{
+@@ -965,11 +1092,13 @@ void CompileD3DShader(const FShaderCompilerInput& Input, FShaderCompilerOutput&
+ 		}
+ 	}
+ 
++#if PLATFORM_WINDOWS || PLATFORM_LINUX
+ 	for (int32 FlagIndex = 0; FlagIndex < Input.Environment.CompilerFlags.Num(); FlagIndex++)
+ 	{
+ 		//accumulate flags set by the shader
+ 		CompileFlags |= TranslateCompilerFlagD3D11((ECompilerFlags)Input.Environment.CompilerFlags[FlagIndex]);
+ 	}
++#endif
+ 
+ 	TArray<FString> FilteredErrors;
+ 	if (bUseDXC)
+@@ -983,11 +1112,17 @@ void CompileD3DShader(const FShaderCompilerInput& Input, FShaderCompilerOutput&
+ 		}
+ 		CrossCompiler::FShaderConductorContext::ConvertCompileErrors(MoveTemp(FilteredErrors), Output.Errors);
+ 	}
++#if PLATFORM_WINDOWS || PLATFORM_LINUX
+ 	else
+ 	{
++#if PLATFORM_WINDOWS
+ 		// Override default compiler path to newer dll
+ 		FString CompilerPath = FPaths::EngineDir();
+ 		CompilerPath.Append(TEXT("Binaries/ThirdParty/Windows/DirectX/x64/d3dcompiler_47.dll"));
++#else
++		// On Linux, libd3dcompiler.so is loaded via dlopen in GetD3DCompilerFuncs
++		FString CompilerPath;
++#endif
+ 
+ 		if (!CompileAndProcessD3DShaderFXC(PreprocessedShaderSource, CompilerPath, CompileFlags, Input, EntryPointName, ShaderProfile, false, FilteredErrors, Output))
+ 		{
+@@ -1023,6 +1158,7 @@ void CompileD3DShader(const FShaderCompilerInput& Input, FShaderCompilerOutput&
+ 			Output.Errors.Add(NewError);
+ 		}
+ 	}
++#endif // PLATFORM_WINDOWS || PLATFORM_LINUX (FXC path)
+ 
+ 	const bool bDirectCompile = FParse::Param(FCommandLine::Get(), TEXT("directcompile"));
+ 	if (bDirectCompile)
+diff --git a/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/D3DShaderCompiler.inl b/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/D3DShaderCompiler.inl
+index c58bdeb3ab0a..30964d28270b 100644
+--- a/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/D3DShaderCompiler.inl
++++ b/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/D3DShaderCompiler.inl
+@@ -2,7 +2,6 @@
+ 
+ #pragma once
+ 
+-
+ class FDxcArguments
+ {
+ protected:
+@@ -40,7 +39,7 @@ public:
+ 
+ 		if (AutoBindingSpace != ~0u)
+ 		{
+-			ExtraArguments.Add(L"/auto-binding-space");
++			ExtraArguments.Add(TEXT("/auto-binding-space"));
+ 			ExtraArguments.Add(FString::Printf(TEXT("%d"), AutoBindingSpace));
+ 		}
+ 
+@@ -48,66 +47,66 @@ public:
+ 		{
+ 			// Ensure that only the requested functions exists in the output DXIL.
+ 			// All other functions and their used resources must be eliminated.
+-			ExtraArguments.Add(L"/exports");
++			ExtraArguments.Add(TEXT("/exports"));
+ 			ExtraArguments.Add(Exports);
+ 		}
+ 
+ 		if (D3DCompileFlags & D3D10_SHADER_PREFER_FLOW_CONTROL)
+ 		{
+ 			D3DCompileFlags &= ~D3D10_SHADER_PREFER_FLOW_CONTROL;
+-			ExtraArguments.Add(L"/Gfp");
++			ExtraArguments.Add(TEXT("/Gfp"));
+ 		}
+ 
+ 		if (D3DCompileFlags & D3D10_SHADER_SKIP_OPTIMIZATION)
+ 		{
+ 			D3DCompileFlags &= ~D3D10_SHADER_SKIP_OPTIMIZATION;
+-			ExtraArguments.Add(L"/Od");
++			ExtraArguments.Add(TEXT("/Od"));
+ 		}
+ 
+ 		if (D3DCompileFlags & D3D10_SHADER_SKIP_VALIDATION)
+ 		{
+ 			D3DCompileFlags &= ~D3D10_SHADER_SKIP_VALIDATION;
+-			ExtraArguments.Add(L"/Vd");
++			ExtraArguments.Add(TEXT("/Vd"));
+ 		}
+ 
+ 		if (D3DCompileFlags & D3D10_SHADER_AVOID_FLOW_CONTROL)
+ 		{
+ 			D3DCompileFlags &= ~D3D10_SHADER_AVOID_FLOW_CONTROL;
+-			ExtraArguments.Add(L"/Gfa");
++			ExtraArguments.Add(TEXT("/Gfa"));
+ 		}
+ 
+ 		if (D3DCompileFlags & D3D10_SHADER_PACK_MATRIX_ROW_MAJOR)
+ 		{
+ 			D3DCompileFlags &= ~D3D10_SHADER_PACK_MATRIX_ROW_MAJOR;
+-			ExtraArguments.Add(L"/Zpr");
++			ExtraArguments.Add(TEXT("/Zpr"));
+ 		}
+ 
+ 		if (D3DCompileFlags & D3D10_SHADER_ENABLE_BACKWARDS_COMPATIBILITY)
+ 		{
+ 			D3DCompileFlags &= ~D3D10_SHADER_ENABLE_BACKWARDS_COMPATIBILITY;
+-			ExtraArguments.Add(L"/Gec");
++			ExtraArguments.Add(TEXT("/Gec"));
+ 		}
+ 
+ 		switch (D3DCompileFlags & SHADER_OPTIMIZATION_LEVEL_MASK)
+ 		{
+ 		case D3D10_SHADER_OPTIMIZATION_LEVEL0:
+ 			D3DCompileFlags &= ~D3D10_SHADER_OPTIMIZATION_LEVEL0;
+-			ExtraArguments.Add(L"/O0");
++			ExtraArguments.Add(TEXT("/O0"));
+ 			break;
+ 
+ 		case D3D10_SHADER_OPTIMIZATION_LEVEL1:
+ 			D3DCompileFlags &= ~D3D10_SHADER_OPTIMIZATION_LEVEL1;
+-			ExtraArguments.Add(L"/O1");
++			ExtraArguments.Add(TEXT("/O1"));
+ 			break;
+ 
+ 		case D3D10_SHADER_OPTIMIZATION_LEVEL2:
+ 			D3DCompileFlags &= ~D3D10_SHADER_OPTIMIZATION_LEVEL2;
+-			ExtraArguments.Add(L"/O2");
++			ExtraArguments.Add(TEXT("/O2"));
+ 			break;
+ 
+ 		case D3D10_SHADER_OPTIMIZATION_LEVEL3:
+ 			D3DCompileFlags &= ~D3D10_SHADER_OPTIMIZATION_LEVEL3;
+-			ExtraArguments.Add(L"/O3");
++			ExtraArguments.Add(TEXT("/O3"));
+ 			break;
+ 
+ 		default:
+@@ -122,20 +121,20 @@ public:
+ 
+ 		if (bEnable16BitTypes)
+ 		{
+-			ExtraArguments.Add(L"/enable-16bit-types");
++			ExtraArguments.Add(TEXT("/enable-16bit-types"));
+ 		}
+ 
+ 		checkf(D3DCompileFlags == 0, TEXT("Unhandled shader compiler flags 0x%x!"), D3DCompileFlags);
+ 
+ 
+-		ExtraArguments.Add(L"/Zss");
+-		ExtraArguments.Add(L"/Qembed_debug");
+-		ExtraArguments.Add(L"/Zi");
+-		ExtraArguments.Add(L"/Fd");
+-		ExtraArguments.Add(L".\\");
++		ExtraArguments.Add(TEXT("/Zss"));
++		ExtraArguments.Add(TEXT("/Qembed_debug"));
++		ExtraArguments.Add(TEXT("/Zi"));
++		ExtraArguments.Add(TEXT("/Fd"));
++		ExtraArguments.Add(TEXT(".\\"));
+ 
+ 		// Reflection will be removed later, otherwise the disassembly won't contain variables
+-		//ExtraArguments.Add(L"/Qstrip_reflect");
++		//ExtraArguments.Add(TEXT("/Qstrip_reflect"));
+ 	}
+ 
+ 	inline FString GetDumpDebugInfoPath() const
+@@ -150,7 +149,7 @@ public:
+ 
+ 	FString GetEntryPointName() const
+ 	{
+-		return Exports.Len() > 0 ? FString(L"") : EntryPoint;
++		return Exports.Len() > 0 ? FString() : EntryPoint;
+ 	}
+ 
+ 	const FString& GetShaderProfile() const
+@@ -163,7 +162,7 @@ public:
+ 		return DumpDisasmFilename;
+ 	}
+ 
+-	void GetCompilerArgsNoEntryNoProfileNoDisasm(TArray<const WCHAR*>& Out) const
++	void GetCompilerArgsNoEntryNoProfileNoDisasm(TArray<const TCHAR*>& Out) const
+ 	{
+ 		for (const FString& Entry : ExtraArguments)
+ 		{
+@@ -171,47 +170,48 @@ public:
+ 		}
+ 	}
+ 
+-	void GetCompilerArgs(TArray<const WCHAR*>& Out) const
++	void GetCompilerArgs(TArray<const TCHAR*>& Out) const
+ 	{
+ 		GetCompilerArgsNoEntryNoProfileNoDisasm(Out);
+ 		if (Exports.Len() == 0)
+ 		{
+-			Out.Add(L"/E");
++			Out.Add(TEXT("/E"));
+ 			Out.Add(*EntryPoint);
+ 		}
+ 
+-		Out.Add(L"/T");
++		Out.Add(TEXT("/T"));
+ 		Out.Add(*ShaderProfile);
+ 
+-		Out.Add(L" /Fc ");
++		Out.Add(TEXT(" /Fc "));
+ 		Out.Add(TEXT("zzz.d3dasm"));	// Dummy
+ 
+-		Out.Add(L" /Fo ");
++		Out.Add(TEXT(" /Fo "));
+ 		Out.Add(TEXT("zzz.dxil"));	// Dummy
+ 	}
+ 
++
+ 	FString GetBatchCommandLineString(const FString& ShaderPath) const
+ 	{
+ 		FString DXCCommandline;
+ 		for (const FString& Entry : ExtraArguments)
+ 		{
+-			DXCCommandline += L" ";
++			DXCCommandline += TEXT(" ");
+ 			DXCCommandline += Entry;
+ 		}
+ 
+-		DXCCommandline += L" /T ";
++		DXCCommandline += TEXT(" /T ");
+ 		DXCCommandline += ShaderProfile;
+ 
+ 		if (Exports.Len() == 0)
+ 		{
+-			DXCCommandline += L" /E ";
++			DXCCommandline += TEXT(" /E ");
+ 			DXCCommandline += EntryPoint;
+ 		}
+ 
+-		DXCCommandline += L" /Fc ";
++		DXCCommandline += TEXT(" /Fc ");
+ 		DXCCommandline += BatchBaseFilename + TEXT(".d3dasm");
+ 
+-		DXCCommandline += L" /Fo ";
++		DXCCommandline += TEXT(" /Fo ");
+ 		DXCCommandline += BatchBaseFilename + TEXT(".dxil");
+ 
+ 		return DXCCommandline;
+@@ -219,6 +219,10 @@ public:
+ };
+ 
+ 
++// Cross-platform reflection support:
++// Windows: Uses Windows SDK headers
++// Linux: Uses D3DShaderTypeDefs.h definitions matching the DXC-provided reflection
++#if PLATFORM_WINDOWS || PLATFORM_LINUX
+ template <typename ID3D1xShaderReflection, typename D3D1x_SHADER_DESC, typename D3D1x_SHADER_INPUT_BIND_DESC,
+ 	typename ID3D1xShaderReflectionConstantBuffer, typename D3D1x_SHADER_BUFFER_DESC,
+ 	typename ID3D1xShaderReflectionVariable, typename D3D1x_SHADER_VARIABLE_DESC>
+@@ -534,3 +538,4 @@ inline void GenerateFinalOutput(TRefCountPtr<TBlob>& CompressedData,
+ 	// Pass the target through to the output.
+ 	Output.Target = Input.Target;
+ }
++#endif // PLATFORM_WINDOWS || PLATFORM_LINUX
+diff --git a/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/D3DShaderCompilerDXC.cpp b/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/D3DShaderCompilerDXC.cpp
+index 7e6b2b66e8d3..24abd0a43306 100644
+--- a/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/D3DShaderCompilerDXC.cpp
++++ b/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/D3DShaderCompilerDXC.cpp
+@@ -3,8 +3,10 @@
+ #include "ShaderFormatD3D.h"
+ #include "ShaderPreprocessor.h"
+ #include "ShaderCompilerCommon.h"
++#if PLATFORM_WINDOWS
+ #include "D3D11ShaderResources.h"
+ #include "D3D12RHI.h"
++#endif
+ #include "Misc/Paths.h"
+ #include "Misc/FileHelper.h"
+ #include "HAL/FileManager.h"
+@@ -16,6 +18,7 @@ DEFINE_LOG_CATEGORY_STATIC(LogD3D12ShaderCompiler, Log, All);
+ // D3D doesn't define a mask for this, so we do so here
+ #define SHADER_OPTIMIZATION_LEVEL_MASK (D3D10_SHADER_OPTIMIZATION_LEVEL0 | D3D10_SHADER_OPTIMIZATION_LEVEL1 | D3D10_SHADER_OPTIMIZATION_LEVEL2 | D3D10_SHADER_OPTIMIZATION_LEVEL3)
+ 
++#if PLATFORM_WINDOWS
+ // Disable macro redefinition warning for compatibility with Windows SDK 8+
+ #pragma warning(push)
+ #pragma warning(disable : 4005)	// macro redefinition
+@@ -35,6 +38,358 @@ MSVC_PRAGMA(warning(disable : 4191)) // warning C4191: 'type cast': unsafe conve
+ #include <dxc/Support/dxcapi.use.h>
+ #include <d3d12shader.h>
+ MSVC_PRAGMA(warning(pop))
++#else
++// Cross-platform: DXC API headers are platform-neutral, d3d12shader.h is not needed
++
++// UINT8 is used by DXC_FOURCC macro but not defined on Linux
++typedef unsigned char UINT8;
++
++// Define __EMULATE_UUID so the DXC headers compile without -fms-extensions.
++// This makes __declspec(uuid(...)) a no-op and provides __uuidof() as a member function.
++//
++// IMPORTANT: The emulated __uuidof() returns char pointers (for identity comparison),
++// NOT real GUID bytes. libdxcompiler.so was compiled with real GUIDs, so we MUST NOT
++// use the emulated __uuidof() or IID_PPV_ARGS. Instead, we use our explicit GUID
++// definitions with DXC_CREATE_INSTANCE and DXC_IID_PPV_ARGS macros.
++//
++// At the ABI level, REFIID (whether 'const void*' or 'const IID&') is just a pointer
++// to a 16-byte GUID struct, so passing &IID_xxx works correctly.
++#define __EMULATE_UUID 1
++
++// Suppress -Wundef warnings from third-party DXC headers
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wundef"
++#include <dxc/dxcapi.h>
++#include <dxc/Support/dxcapi.use.h>
++#pragma clang diagnostic pop
++
++// Provide stub definitions for DEFINE_CROSS_PLATFORM_UUIDOF to satisfy linker
++// These are never actually used - we use explicit GUIDs instead
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcBlob)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcBlobEncoding)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcBlobUtf16)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcBlobUtf8)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcIncludeHandler)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcCompilerArgs)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcLibrary)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcOperationResult)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcCompiler)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcCompiler2)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcCompiler3)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcLinker)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcUtils)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcResult)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcValidator)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcContainerBuilder)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcAssembler)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcContainerReflection)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcOptimizerPass)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcOptimizer)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcVersionInfo)
++DEFINE_CROSS_PLATFORM_UUIDOF(IDxcVersionInfo2)
++DEFINE_CROSS_PLATFORM_UUIDOF(IUnknown)
++
++// Define actual GUIDs for DXC interfaces - these contain the real GUID bytes
++// that libdxcompiler.so expects (not the char pointer stubs from emulation)
++// Values are extracted from the __declspec(uuid(...)) declarations in dxcapi.h
++static const GUID IID_IDxcCompiler3 = { 0x228B4687, 0x5A6A, 0x4730, { 0x90, 0x0C, 0x97, 0x02, 0xB2, 0x20, 0x3F, 0x54 } };
++static const GUID IID_IDxcLibrary = { 0xe5204dc7, 0xd18c, 0x4c3c, { 0xbd, 0xfb, 0x85, 0x16, 0x73, 0x98, 0x0f, 0xe7 } };
++static const GUID IID_IDxcUtils = { 0x4605C4CB, 0x2019, 0x492A, { 0xAD, 0xA4, 0x65, 0xF2, 0x0B, 0xB7, 0xD6, 0x7F } };
++static const GUID IID_IDxcContainerBuilder = { 0x334b1f50, 0x2292, 0x4b35, { 0x99, 0xa1, 0x25, 0x58, 0x8d, 0x8c, 0x17, 0xfe } };
++static const GUID IID_IDxcContainerReflection = { 0xd2c21b26, 0x8350, 0x4bdc, { 0x97, 0x6a, 0x33, 0x1c, 0xe6, 0xf4, 0xc5, 0x4c } };
++static const GUID IID_IDxcResult = { 0x58346CDA, 0xDDE7, 0x4497, { 0x94, 0x61, 0x6F, 0x87, 0xAF, 0x5E, 0x06, 0x59 } };
++static const GUID IID_IDxcBlobEncoding = { 0x7241d424, 0x2646, 0x4191, { 0x97, 0xc0, 0x98, 0xe9, 0x6e, 0x42, 0xfc, 0x68 } };
++static const GUID IID_IDxcBlob = { 0x8BA5FB08, 0x5195, 0x40e2, { 0xAC, 0x58, 0x0D, 0x98, 0x9C, 0x3A, 0x01, 0x02 } };
++
++// Macros to call DXC APIs with real GUIDs (not the emulated char pointers)
++// Pass pointer to GUID struct - at ABI level this matches what libdxcompiler.so expects
++#define DXC_CREATE_INSTANCE(DxcDllHelper, CLSID, Type, ppResult) \
++	DxcDllHelper.CreateInstance(CLSID, (REFIID)&IID_##Type, (IUnknown**)ppResult)
++
++// Cross-platform replacement for IID_PPV_ARGS that uses explicit GUIDs on Linux
++// Usage: DXC_IID_PPV_ARGS(IDxcResult, ptr.GetInitReference())
++#define DXC_IID_PPV_ARGS(Type, ppResult) \
++	(REFIID)&IID_##Type, reinterpret_cast<void**>(ppResult)
++
++#include "D3DShaderTypeDefs.h"
++
++//===----------------------------------------------------------------------===//
++// D3D12 Shader Reflection Structures (for Linux cross-compilation)
++// These use Windows types from WinAdapter.h (included via dxcapi.h)
++//===----------------------------------------------------------------------===//
++
++typedef struct _D3D12_SIGNATURE_PARAMETER_DESC
++{
++	LPCSTR                      SemanticName;
++	UINT                        SemanticIndex;
++	UINT                        Register;
++	D3D_NAME                    SystemValueType;
++	D3D_REGISTER_COMPONENT_TYPE ComponentType;
++	BYTE                        Mask;
++	BYTE                        ReadWriteMask;
++	UINT                        Stream;
++	D3D_MIN_PRECISION           MinPrecision;
++} D3D12_SIGNATURE_PARAMETER_DESC;
++
++typedef struct _D3D12_SHADER_BUFFER_DESC
++{
++	LPCSTR                  Name;
++	D3D_CBUFFER_TYPE        Type;
++	UINT                    Variables;
++	UINT                    Size;
++	UINT                    uFlags;
++} D3D12_SHADER_BUFFER_DESC;
++
++typedef struct _D3D12_SHADER_VARIABLE_DESC
++{
++	LPCSTR                  Name;
++	UINT                    StartOffset;
++	UINT                    Size;
++	UINT                    uFlags;
++	LPVOID                  DefaultValue;
++	UINT                    StartTexture;
++	UINT                    TextureSize;
++	UINT                    StartSampler;
++	UINT                    SamplerSize;
++} D3D12_SHADER_VARIABLE_DESC;
++
++typedef struct _D3D12_SHADER_TYPE_DESC
++{
++	D3D_SHADER_VARIABLE_CLASS   Class;
++	D3D_SHADER_VARIABLE_TYPE    Type;
++	UINT                        Rows;
++	UINT                        Columns;
++	UINT                        Elements;
++	UINT                        Members;
++	UINT                        Offset;
++	LPCSTR                      Name;
++} D3D12_SHADER_TYPE_DESC;
++
++typedef struct _D3D12_SHADER_DESC
++{
++	UINT                    Version;
++	LPCSTR                  Creator;
++	UINT                    Flags;
++	UINT                    ConstantBuffers;
++	UINT                    BoundResources;
++	UINT                    InputParameters;
++	UINT                    OutputParameters;
++	UINT                    InstructionCount;
++	UINT                    TempRegisterCount;
++	UINT                    TempArrayCount;
++	UINT                    DefCount;
++	UINT                    DclCount;
++	UINT                    TextureNormalInstructions;
++	UINT                    TextureLoadInstructions;
++	UINT                    TextureCompInstructions;
++	UINT                    TextureBiasInstructions;
++	UINT                    TextureGradientInstructions;
++	UINT                    FloatInstructionCount;
++	UINT                    IntInstructionCount;
++	UINT                    UintInstructionCount;
++	UINT                    StaticFlowControlCount;
++	UINT                    DynamicFlowControlCount;
++	UINT                    MacroInstructionCount;
++	UINT                    ArrayInstructionCount;
++	UINT                    CutInstructionCount;
++	UINT                    EmitInstructionCount;
++	D3D_PRIMITIVE_TOPOLOGY  GSOutputTopology;
++	UINT                    GSMaxOutputVertexCount;
++	D3D_PRIMITIVE           InputPrimitive;
++	UINT                    PatchConstantParameters;
++	UINT                    cGSInstanceCount;
++	UINT                    cControlPoints;
++	D3D_TESSELLATOR_OUTPUT_PRIMITIVE HSOutputPrimitive;
++	D3D_TESSELLATOR_PARTITIONING HSPartitioning;
++	D3D_TESSELLATOR_DOMAIN  TessellatorDomain;
++	UINT cBarrierInstructions;
++	UINT cInterlockedInstructions;
++	UINT cTextureStoreInstructions;
++} D3D12_SHADER_DESC;
++
++typedef struct _D3D12_SHADER_INPUT_BIND_DESC
++{
++	LPCSTR                      Name;
++	D3D_SHADER_INPUT_TYPE       Type;
++	UINT                        BindPoint;
++	UINT                        BindCount;
++	UINT                        uFlags;
++	D3D_RESOURCE_RETURN_TYPE    ReturnType;
++	D3D_SRV_DIMENSION           Dimension;
++	UINT                        NumSamples;
++	UINT                        Space;
++	UINT                        uID;
++} D3D12_SHADER_INPUT_BIND_DESC;
++
++typedef struct _D3D12_LIBRARY_DESC
++{
++	LPCSTR    Creator;
++	UINT      Flags;
++	UINT      FunctionCount;
++} D3D12_LIBRARY_DESC;
++
++typedef struct _D3D12_FUNCTION_DESC
++{
++	UINT                    Version;
++	LPCSTR                  Creator;
++	UINT                    Flags;
++	UINT                    ConstantBuffers;
++	UINT                    BoundResources;
++	UINT                    InstructionCount;
++	UINT                    TempRegisterCount;
++	UINT                    TempArrayCount;
++	UINT                    DefCount;
++	UINT                    DclCount;
++	UINT                    TextureNormalInstructions;
++	UINT                    TextureLoadInstructions;
++	UINT                    TextureCompInstructions;
++	UINT                    TextureBiasInstructions;
++	UINT                    TextureGradientInstructions;
++	UINT                    FloatInstructionCount;
++	UINT                    IntInstructionCount;
++	UINT                    UintInstructionCount;
++	UINT                    StaticFlowControlCount;
++	UINT                    DynamicFlowControlCount;
++	UINT                    MacroInstructionCount;
++	UINT                    ArrayInstructionCount;
++	UINT                    MovInstructionCount;
++	UINT                    MovcInstructionCount;
++	UINT                    ConversionInstructionCount;
++	UINT                    BitwiseInstructionCount;
++	D3D_FEATURE_LEVEL       MinFeatureLevel;
++	UINT64                  RequiredFeatureFlags;
++	LPCSTR                  Name;
++	INT                     FunctionParameterCount;
++	BOOL                    HasReturn;
++	BOOL                    Has10Level9VertexShader;
++	BOOL                    Has10Level9PixelShader;
++} D3D12_FUNCTION_DESC;
++
++typedef struct _D3D12_PARAMETER_DESC
++{
++	LPCSTR                      Name;
++	LPCSTR                      SemanticName;
++	D3D_SHADER_VARIABLE_TYPE    Type;
++	D3D_SHADER_VARIABLE_CLASS   Class;
++	UINT                        Rows;
++	UINT                        Columns;
++	D3D_INTERPOLATION_MODE      InterpolationMode;
++	D3D_PARAMETER_FLAGS         Flags;
++	UINT                        FirstInRegister;
++	UINT                        FirstInComponent;
++	UINT                        FirstOutRegister;
++	UINT                        FirstOutComponent;
++} D3D12_PARAMETER_DESC;
++
++//===----------------------------------------------------------------------===//
++// D3D12 Shader Reflection Interfaces
++// These must match the vtable layout expected by DXC's implementation
++//===----------------------------------------------------------------------===//
++
++// Forward declarations
++struct ID3D12ShaderReflectionType;
++struct ID3D12ShaderReflectionVariable;
++struct ID3D12ShaderReflectionConstantBuffer;
++struct ID3D12ShaderReflection;
++struct ID3D12LibraryReflection;
++struct ID3D12FunctionReflection;
++struct ID3D12FunctionParameterReflection;
++
++// ID3D12ShaderReflectionType
++struct ID3D12ShaderReflectionType
++{
++	virtual HRESULT STDMETHODCALLTYPE GetDesc(D3D12_SHADER_TYPE_DESC *pDesc) = 0;
++	virtual ID3D12ShaderReflectionType* STDMETHODCALLTYPE GetMemberTypeByIndex(UINT Index) = 0;
++	virtual ID3D12ShaderReflectionType* STDMETHODCALLTYPE GetMemberTypeByName(LPCSTR Name) = 0;
++	virtual LPCSTR STDMETHODCALLTYPE GetMemberTypeName(UINT Index) = 0;
++	virtual HRESULT STDMETHODCALLTYPE IsEqual(ID3D12ShaderReflectionType* pType) = 0;
++	virtual ID3D12ShaderReflectionType* STDMETHODCALLTYPE GetSubType() = 0;
++	virtual ID3D12ShaderReflectionType* STDMETHODCALLTYPE GetBaseClass() = 0;
++	virtual UINT STDMETHODCALLTYPE GetNumInterfaces() = 0;
++	virtual ID3D12ShaderReflectionType* STDMETHODCALLTYPE GetInterfaceByIndex(UINT uIndex) = 0;
++	virtual HRESULT STDMETHODCALLTYPE IsOfType(ID3D12ShaderReflectionType* pType) = 0;
++	virtual HRESULT STDMETHODCALLTYPE ImplementsInterface(ID3D12ShaderReflectionType* pBase) = 0;
++};
++
++// ID3D12ShaderReflectionVariable
++struct ID3D12ShaderReflectionVariable
++{
++	virtual HRESULT STDMETHODCALLTYPE GetDesc(D3D12_SHADER_VARIABLE_DESC *pDesc) = 0;
++	virtual ID3D12ShaderReflectionType* STDMETHODCALLTYPE GetType() = 0;
++	virtual ID3D12ShaderReflectionConstantBuffer* STDMETHODCALLTYPE GetBuffer() = 0;
++	virtual UINT STDMETHODCALLTYPE GetInterfaceSlot(UINT uArrayIndex) = 0;
++};
++
++// ID3D12ShaderReflectionConstantBuffer
++struct ID3D12ShaderReflectionConstantBuffer
++{
++	virtual HRESULT STDMETHODCALLTYPE GetDesc(D3D12_SHADER_BUFFER_DESC *pDesc) = 0;
++	virtual ID3D12ShaderReflectionVariable* STDMETHODCALLTYPE GetVariableByIndex(UINT Index) = 0;
++	virtual ID3D12ShaderReflectionVariable* STDMETHODCALLTYPE GetVariableByName(LPCSTR Name) = 0;
++};
++
++// ID3D12ShaderReflection - inherits from IUnknown (defined in WinAdapter.h)
++struct ID3D12ShaderReflection : public IUnknown
++{
++	virtual HRESULT STDMETHODCALLTYPE GetDesc(D3D12_SHADER_DESC *pDesc) = 0;
++	virtual ID3D12ShaderReflectionConstantBuffer* STDMETHODCALLTYPE GetConstantBufferByIndex(UINT Index) = 0;
++	virtual ID3D12ShaderReflectionConstantBuffer* STDMETHODCALLTYPE GetConstantBufferByName(LPCSTR Name) = 0;
++	virtual HRESULT STDMETHODCALLTYPE GetResourceBindingDesc(UINT ResourceIndex, D3D12_SHADER_INPUT_BIND_DESC *pDesc) = 0;
++	virtual HRESULT STDMETHODCALLTYPE GetInputParameterDesc(UINT ParameterIndex, D3D12_SIGNATURE_PARAMETER_DESC *pDesc) = 0;
++	virtual HRESULT STDMETHODCALLTYPE GetOutputParameterDesc(UINT ParameterIndex, D3D12_SIGNATURE_PARAMETER_DESC *pDesc) = 0;
++	virtual HRESULT STDMETHODCALLTYPE GetPatchConstantParameterDesc(UINT ParameterIndex, D3D12_SIGNATURE_PARAMETER_DESC *pDesc) = 0;
++	virtual ID3D12ShaderReflectionVariable* STDMETHODCALLTYPE GetVariableByName(LPCSTR Name) = 0;
++	virtual HRESULT STDMETHODCALLTYPE GetResourceBindingDescByName(LPCSTR Name, D3D12_SHADER_INPUT_BIND_DESC *pDesc) = 0;
++	virtual UINT STDMETHODCALLTYPE GetMovInstructionCount() = 0;
++	virtual UINT STDMETHODCALLTYPE GetMovcInstructionCount() = 0;
++	virtual UINT STDMETHODCALLTYPE GetConversionInstructionCount() = 0;
++	virtual UINT STDMETHODCALLTYPE GetBitwiseInstructionCount() = 0;
++	virtual D3D_PRIMITIVE STDMETHODCALLTYPE GetGSInputPrimitive() = 0;
++	virtual BOOL STDMETHODCALLTYPE IsSampleFrequencyShader() = 0;
++	virtual UINT STDMETHODCALLTYPE GetNumInterfaceSlots() = 0;
++	virtual HRESULT STDMETHODCALLTYPE GetMinFeatureLevel(D3D_FEATURE_LEVEL* pLevel) = 0;
++	virtual UINT STDMETHODCALLTYPE GetThreadGroupSize(UINT* pSizeX, UINT* pSizeY, UINT* pSizeZ) = 0;
++	virtual UINT64 STDMETHODCALLTYPE GetRequiresFlags() = 0;
++};
++
++// ID3D12FunctionParameterReflection
++struct ID3D12FunctionParameterReflection
++{
++	virtual HRESULT STDMETHODCALLTYPE GetDesc(D3D12_PARAMETER_DESC *pDesc) = 0;
++};
++
++// ID3D12FunctionReflection
++struct ID3D12FunctionReflection
++{
++	virtual HRESULT STDMETHODCALLTYPE GetDesc(D3D12_FUNCTION_DESC *pDesc) = 0;
++	virtual ID3D12ShaderReflectionConstantBuffer* STDMETHODCALLTYPE GetConstantBufferByIndex(UINT BufferIndex) = 0;
++	virtual ID3D12ShaderReflectionConstantBuffer* STDMETHODCALLTYPE GetConstantBufferByName(LPCSTR Name) = 0;
++	virtual HRESULT STDMETHODCALLTYPE GetResourceBindingDesc(UINT ResourceIndex, D3D12_SHADER_INPUT_BIND_DESC *pDesc) = 0;
++	virtual ID3D12ShaderReflectionVariable* STDMETHODCALLTYPE GetVariableByName(LPCSTR Name) = 0;
++	virtual HRESULT STDMETHODCALLTYPE GetResourceBindingDescByName(LPCSTR Name, D3D12_SHADER_INPUT_BIND_DESC *pDesc) = 0;
++	virtual ID3D12FunctionParameterReflection* STDMETHODCALLTYPE GetFunctionParameter(INT ParameterIndex) = 0;
++};
++
++// ID3D12LibraryReflection - inherits from IUnknown (defined in WinAdapter.h)
++struct ID3D12LibraryReflection : public IUnknown
++{
++	virtual HRESULT STDMETHODCALLTYPE GetDesc(D3D12_LIBRARY_DESC *pDesc) = 0;
++	virtual ID3D12FunctionReflection* STDMETHODCALLTYPE GetFunctionByIndex(INT FunctionIndex) = 0;
++};
++
++// IIDs for D3D12 shader reflection interfaces
++static const GUID IID_ID3D12ShaderReflection = { 0x5a58797d, 0xa72c, 0x478d, { 0x8b, 0xa2, 0xef, 0xc6, 0xb0, 0xef, 0xe8, 0x8e } };
++static const GUID IID_ID3D12LibraryReflection = { 0x8e349d19, 0x54db, 0x4a56, { 0x9d, 0xc9, 0x11, 0x9d, 0x87, 0xbd, 0xb8, 0x04 } };
++
++#endif // PLATFORM_WINDOWS
++
++#if PLATFORM_WINDOWS
++// On Windows, use the template version that relies on __uuidof
++#define DXC_CREATE_INSTANCE(DxcDllHelper, CLSID, Type, ppResult) \
++	DxcDllHelper.CreateInstance(CLSID, ppResult)
++// On Windows, use standard IID_PPV_ARGS
++#define DXC_IID_PPV_ARGS(Type, ppResult) IID_PPV_ARGS(ppResult)
++#endif
+ 
+ THIRD_PARTY_INCLUDES_START
+ 	#include <string>
+@@ -120,6 +475,9 @@ static int32 HandleException(LPEXCEPTION_POINTERS ExceptionInfo)
+ 	FPlatformStackWalk::StackWalkAndDump(GDxcStackTrace, UE_ARRAY_COUNT(GDxcStackTrace), NumStackFramesToIgnore, nullptr);
+ 	return EXCEPTION_EXECUTE_HANDLER;
+ }
++#elif PLATFORM_LINUX
++// Linux: No SEH, simpler error handling
++static const char* GDxcStackTrace = "(stack trace not available on Linux)";
+ #else
+ static const char* GDxcStackTrace = "";
+ #endif
+@@ -154,7 +512,7 @@ static HRESULT InnerDXCCompileWrapper(
+ 			Arguments,							// array of pointers to arguments
+ 			NumArguments,						// number of arguments
+ 			nullptr,							// user-provided interface to handle #include directives (optional)
+-			IID_PPV_ARGS(OutCompileResult.GetInitReference())	// compiler output status, buffer, and errors
++			DXC_IID_PPV_ARGS(IDxcResult, OutCompileResult.GetInitReference())	// compiler output status, buffer, and errors
+ 		);
+ 	}
+ #if !PLATFORM_SEH_EXCEPTIONS_DISABLED && PLATFORM_WINDOWS
+@@ -174,8 +532,28 @@ static HRESULT DXCCompileWrapper(
+ {
+ 	bool bExceptionError = false;
+ 
++	TArray<const TCHAR*> TCharArgs;
++	Arguments.GetCompilerArgs(TCharArgs);
++
++#if PLATFORM_WINDOWS
++	// On Windows, TCHAR == WCHAR, so we can cast directly
++	TArray<const WCHAR*> CompilerArgs;
++	for (const TCHAR* Arg : TCharArgs)
++	{
++		CompilerArgs.Add((const WCHAR*)Arg);
++	}
++#else
++	// On non-Windows, convert TCHAR to WCHAR for DXC API
++	TArray<FTCHARToWChar> ConvertedArgs;
+ 	TArray<const WCHAR*> CompilerArgs;
+-	Arguments.GetCompilerArgs(CompilerArgs);
++	ConvertedArgs.Reserve(TCharArgs.Num());
++	CompilerArgs.Reserve(TCharArgs.Num());
++	for (const TCHAR* Arg : TCharArgs)
++	{
++		ConvertedArgs.Emplace(Arg);
++		CompilerArgs.Add(ConvertedArgs.Last().Get());
++	}
++#endif
+ 
+ 	HRESULT Result = InnerDXCCompileWrapper(Compiler, TextBlob,
+ 		CompilerArgs.GetData(), CompilerArgs.Num(), bExceptionError, OutCompileResult);
+@@ -212,7 +590,7 @@ static void DisassembleAndSave(TRefCountPtr<IDxcCompiler3>& Compiler, IDxcBlob*
+ 	DxcBuffer DisasmBuffer = { 0 };
+ 	DisasmBuffer.Size = Dxil->GetBufferSize();
+ 	DisasmBuffer.Ptr = Dxil->GetBufferPointer();
+-	if (SUCCEEDED(Compiler->Disassemble(&DisasmBuffer, IID_PPV_ARGS(DisasmResult.GetInitReference()))))
++	if (SUCCEEDED(Compiler->Disassemble(&DisasmBuffer, DXC_IID_PPV_ARGS(IDxcResult, DisasmResult.GetInitReference()))))
+ 	{
+ 		HRESULT DisasmCodeResult;
+ 		DisasmResult->GetStatus(&DisasmCodeResult);
+@@ -221,7 +599,7 @@ static void DisassembleAndSave(TRefCountPtr<IDxcCompiler3>& Compiler, IDxcBlob*
+ 			checkf(DisasmResult->HasOutput(DXC_OUT_DISASSEMBLY), TEXT("Disasm part missing but container said it has one!"));
+ 			TRefCountPtr<IDxcBlobEncoding> DisasmBlob;
+ 			TRefCountPtr<IDxcBlobUtf16> Dummy;
+-			VERIFYHRESULT(DisasmResult->GetOutput(DXC_OUT_DISASSEMBLY, IID_PPV_ARGS(DisasmBlob.GetInitReference()), Dummy.GetInitReference()));
++			VERIFYHRESULT(DisasmResult->GetOutput(DXC_OUT_DISASSEMBLY, DXC_IID_PPV_ARGS(IDxcBlobEncoding, DisasmBlob.GetInitReference()), Dummy.GetInitReference()));
+ 			FString String = DxcBlobEncodingToFString(DisasmBlob);
+ 			FFileHelper::SaveStringToFile(String, *DisasmFilename);
+ 		}
+@@ -232,7 +610,7 @@ static void DumpFourCCParts(dxc::DxcDllSupport& DxcDllHelper, TRefCountPtr<IDxcB
+ {
+ #if UE_BUILD_DEBUG && IS_PROGRAM
+ 	TRefCountPtr<IDxcContainerReflection> Refl;
+-	VERIFYHRESULT(DxcDllHelper.CreateInstance(CLSID_DxcContainerReflection, Refl.GetInitReference()));
++	VERIFYHRESULT(DXC_CREATE_INSTANCE(DxcDllHelper, CLSID_DxcContainerReflection, IDxcContainerReflection, Refl.GetInitReference()));
+ 
+ 	VERIFYHRESULT(Refl->Load(Blob));
+ 
+@@ -258,7 +636,7 @@ static bool RemoveContainerReflection(dxc::DxcDllSupport& DxcDllHelper, TRefCoun
+ 	TRefCountPtr<IDxcContainerBuilder> Builder;
+ 	TRefCountPtr<IDxcBlob> StrippedDxil;
+ 
+-	VERIFYHRESULT(DxcDllHelper.CreateInstance(CLSID_DxcContainerBuilder, Builder.GetInitReference()));
++	VERIFYHRESULT(DXC_CREATE_INSTANCE(DxcDllHelper, CLSID_DxcContainerBuilder, IDxcContainerBuilder, Builder.GetInitReference()));
+ 	VERIFYHRESULT(Builder->Load(Dxil));
+ 	
+ 	// Try and remove both the PDB & Reflection Data
+@@ -284,10 +662,10 @@ static HRESULT D3DCompileToDxil(const char* SourceText, FDxcArguments& Arguments
+ 	dxc::DxcDllSupport& DxcDllHelper = GetDxcDllHelper();
+ 
+ 	TRefCountPtr<IDxcCompiler3> Compiler;
+-	VERIFYHRESULT(DxcDllHelper.CreateInstance(CLSID_DxcCompiler, Compiler.GetInitReference()));
++	VERIFYHRESULT(DXC_CREATE_INSTANCE(DxcDllHelper, CLSID_DxcCompiler, IDxcCompiler3, Compiler.GetInitReference()));
+ 
+ 	TRefCountPtr<IDxcLibrary> Library;
+-	VERIFYHRESULT(DxcDllHelper.CreateInstance(CLSID_DxcLibrary, Library.GetInitReference()));
++	VERIFYHRESULT(DXC_CREATE_INSTANCE(DxcDllHelper, CLSID_DxcLibrary, IDxcLibrary, Library.GetInitReference()));
+ 
+ 	TRefCountPtr<IDxcBlobEncoding> TextBlob;
+ 	VERIFYHRESULT(Library->CreateBlobWithEncodingFromPinned((LPBYTE)SourceText, FCStringAnsi::Strlen(SourceText), CP_UTF8, TextBlob.GetInitReference()));
+@@ -301,10 +679,10 @@ static HRESULT D3DCompileToDxil(const char* SourceText, FDxcArguments& Arguments
+ 	{
+ 		TRefCountPtr<IDxcBlobUtf16> Dummy;
+ 		checkf(CompileResult->HasOutput(DXC_OUT_OBJECT), TEXT("No object code found!"));
+-		VERIFYHRESULT(CompileResult->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(OutDxilBlob.GetInitReference()), Dummy.GetInitReference()));
++		VERIFYHRESULT(CompileResult->GetOutput(DXC_OUT_OBJECT, DXC_IID_PPV_ARGS(IDxcBlob, OutDxilBlob.GetInitReference()), Dummy.GetInitReference()));
+ 
+ 		checkf(CompileResult->HasOutput(DXC_OUT_REFLECTION), TEXT("No reflection found!"));
+-		VERIFYHRESULT(CompileResult->GetOutput(DXC_OUT_REFLECTION, IID_PPV_ARGS(OutReflectionBlob.GetInitReference()), Dummy.GetInitReference()));
++		VERIFYHRESULT(CompileResult->GetOutput(DXC_OUT_REFLECTION, DXC_IID_PPV_ARGS(IDxcBlob, OutReflectionBlob.GetInitReference()), Dummy.GetInitReference()));
+ 
+ 		if (Arguments.ShouldDump())
+ 		{
+@@ -320,10 +698,10 @@ static HRESULT D3DCompileToDxil(const char* SourceText, FDxcArguments& Arguments
+ 			if (CompileResult->HasOutput(DXC_OUT_PDB) && CompileResult->HasOutput(DXC_OUT_SHADER_HASH))
+ 			{
+ 				TRefCountPtr<IDxcBlob> PdbBlob;
+-				VERIFYHRESULT(CompileResult->GetOutput(DXC_OUT_PDB, IID_PPV_ARGS(PdbBlob.GetInitReference()), Dummy.GetInitReference()));
++				VERIFYHRESULT(CompileResult->GetOutput(DXC_OUT_PDB, DXC_IID_PPV_ARGS(IDxcBlob, PdbBlob.GetInitReference()), Dummy.GetInitReference()));
+ 
+ 				TRefCountPtr<IDxcBlob> HashBlob;
+-				VERIFYHRESULT(CompileResult->GetOutput(DXC_OUT_SHADER_HASH, IID_PPV_ARGS(HashBlob.GetInitReference()), Dummy.GetInitReference()));
++				VERIFYHRESULT(CompileResult->GetOutput(DXC_OUT_SHADER_HASH, DXC_IID_PPV_ARGS(IDxcBlob, HashBlob.GetInitReference()), Dummy.GetInitReference()));
+ 
+ 				check(sizeof(DxcShaderHash) == HashBlob->GetBufferSize());
+ 				const DxcShaderHash* ShaderHash = (DxcShaderHash*)HashBlob->GetBufferPointer();
+@@ -343,10 +721,14 @@ static HRESULT D3DCompileToDxil(const char* SourceText, FDxcArguments& Arguments
+ 		}
+ 
+ 		DumpFourCCParts(DxcDllHelper, OutDxilBlob);
++#if PLATFORM_WINDOWS
++		// IDxcContainerBuilder::Load crashes on Linux with ShaderConductor's libdxcompiler.so
++		// Skip reflection stripping on Linux - shaders will be larger but functional
+ 		if (RemoveContainerReflection(DxcDllHelper, OutDxilBlob))
+ 		{
+ 			DumpFourCCParts(DxcDllHelper, OutDxilBlob);
+ 		}
++#endif
+ 
+ 		if (Arguments.ShouldDump())
+ 		{
+@@ -383,10 +765,12 @@ static FString D3DCreateDXCCompileBatchFile(const FDxcArguments& Args, const FSt
+ 	return BatchFileHeader + DXCCommandline + TEXT("\npause\n");
+ }
+ 
++#if PLATFORM_WINDOWS || PLATFORM_LINUX
+ inline bool IsCompatibleBinding(const D3D12_SHADER_INPUT_BIND_DESC& BindDesc, uint32 BindingSpace)
+ {
+ 	return BindDesc.Space == BindingSpace;
+ }
++#endif
+ 
+ // Parses ray tracing shader entry point specification string in one of the following formats:
+ // 1) Verbatim single entry point name, e.g. "MainRGS"
+@@ -463,7 +847,7 @@ static ShaderConductor::Compiler::ResultDesc DXCRewriteWrapper(const ShaderCondu
+ 	bool& bOutException)
+ {
+ 	bOutException = false;
+-#if !PLATFORM_SEH_EXCEPTIONS_DISABLED
++#if !PLATFORM_SEH_EXCEPTIONS_DISABLED && PLATFORM_WINDOWS
+ 	__try
+ #endif
+ 	{
+@@ -471,7 +855,7 @@ static ShaderConductor::Compiler::ResultDesc DXCRewriteWrapper(const ShaderCondu
+ 		InnerDXCRewriteWrapper(InDesc, InOptions, ResultDesc);
+ 		return ResultDesc;
+ 	}
+-#if !PLATFORM_SEH_EXCEPTIONS_DISABLED
++#if !PLATFORM_SEH_EXCEPTIONS_DISABLED && PLATFORM_WINDOWS
+ 	__except (EXCEPTION_EXECUTE_HANDLER)
+ 	{
+ 		GSCWErrorCode = ESCWErrorCode::CrashInsidePlatformCompiler;
+@@ -682,7 +1066,7 @@ bool CompileAndProcessD3DShaderDXC(FString& PreprocessedShaderSource,
+ 
+ 	if (SUCCEEDED(Result))
+ 	{
+-		// Gather reflection information
++		// Gather reflection information (works on Windows and Linux with DXC)
+ 		int32 NumInterpolants = 0;
+ 		TIndirectArray<FString> InterpolantNames;
+ 		TArray<FString> ShaderInputs;
+@@ -701,16 +1085,32 @@ bool CompileAndProcessD3DShaderDXC(FString& PreprocessedShaderSource,
+ 		UsedUniformBufferSlots.Init(false, 32);
+ 
+ 		dxc::DxcDllSupport& DxcDllHelper = GetDxcDllHelper();
++
++#if PLATFORM_WINDOWS
++		// On Windows, use IDxcUtils::CreateReflection with the separate reflection blob
+ 		TRefCountPtr<IDxcUtils> Utils;
+-		VERIFYHRESULT(DxcDllHelper.CreateInstance(CLSID_DxcUtils, Utils.GetInitReference()));
++		VERIFYHRESULT(DXC_CREATE_INSTANCE(DxcDllHelper, CLSID_DxcUtils, IDxcUtils, Utils.GetInitReference()));
+ 		DxcBuffer ReflBuffer = { 0 };
+ 		ReflBuffer.Ptr = ReflectionBlob->GetBufferPointer();
+ 		ReflBuffer.Size = ReflectionBlob->GetBufferSize();
++#else
++		// On Linux, IDxcUtils::CreateReflection returns E_NOTIMPL and IDxcContainerReflection::Load
++		// crashes with ShaderConductor's libdxcompiler.so. Fall back to using DxcBuffer with
++		// the ReflectionBlob but use a manual approach.
++		//
++		// For now, create a DxcBuffer from ReflectionBlob and try the CreateReflection path
++		// with proper error handling instead of fatal errors.
++		TRefCountPtr<IDxcUtils> Utils;
++		VERIFYHRESULT(DXC_CREATE_INSTANCE(DxcDllHelper, CLSID_DxcUtils, IDxcUtils, Utils.GetInitReference()));
++		DxcBuffer ReflBuffer = { 0 };
++		ReflBuffer.Ptr = ReflectionBlob->GetBufferPointer();
++		ReflBuffer.Size = ReflectionBlob->GetBufferSize();
++#endif
+ 
+ 		if (bIsRayTracingShader)
+ 		{
+ 			TRefCountPtr<ID3D12LibraryReflection> LibraryReflection;
+-			Result = Utils->CreateReflection(&ReflBuffer, IID_PPV_ARGS(LibraryReflection.GetInitReference()));
++			Result = Utils->CreateReflection(&ReflBuffer, DXC_IID_PPV_ARGS(ID3D12LibraryReflection, LibraryReflection.GetInitReference()));
+ 
+ 			if (FAILED(Result))
+ 			{
+@@ -814,7 +1214,7 @@ bool CompileAndProcessD3DShaderDXC(FString& PreprocessedShaderSource,
+ 		{
+ 
+ 			TRefCountPtr<ID3D12ShaderReflection> ShaderReflection;
+-			Result = Utils->CreateReflection(&ReflBuffer, IID_PPV_ARGS(ShaderReflection.GetInitReference()));
++			Result = Utils->CreateReflection(&ReflBuffer, DXC_IID_PPV_ARGS(ID3D12ShaderReflection, ShaderReflection.GetInitReference()));
+ 			if (FAILED(Result))
+ 			{
+ 				UE_LOG(LogD3D12ShaderCompiler, Fatal, TEXT("D3DReflectDxil failed: Result=%08x"), Result);
+diff --git a/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/ShaderFormatD3D.cpp b/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/ShaderFormatD3D.cpp
+index dbe1a8a07ca4..928f93062bb8 100644
+--- a/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/ShaderFormatD3D.cpp
++++ b/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/ShaderFormatD3D.cpp
+@@ -5,7 +5,7 @@
+ #include "Modules/ModuleManager.h"
+ #include "Interfaces/IShaderFormat.h"
+ #include "Interfaces/IShaderFormatModule.h"
+-#include "DxcWrapper.h"
++#include "DXCWrapper.h"
+ 
+ static FName NAME_PCD3D_SM5(TEXT("PCD3D_SM5"));
+ static FName NAME_PCD3D_ES3_1(TEXT("PCD3D_ES31"));
+diff --git a/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/ShaderFormatD3D.h b/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/ShaderFormatD3D.h
+index c6715f641c8e..378ff9d883dd 100644
+--- a/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/ShaderFormatD3D.h
++++ b/Engine/Source/Developer/Windows/ShaderFormatD3D/Private/ShaderFormatD3D.h
+@@ -2,7 +2,9 @@
+ 
+ #pragma once
+ 
++#if PLATFORM_WINDOWS
+ #include "Windows/WindowsHWrapper.h"
++#endif
+ 
+ struct FShaderTarget;
+ 
+@@ -14,10 +16,12 @@ enum class ELanguage
+ 
+ void CompileShader_Windows(const struct FShaderCompilerInput& Input,struct FShaderCompilerOutput& Output,const class FString& WorkingDirectory, ELanguage Language);
+ 
++#if PLATFORM_WINDOWS || PLATFORM_LINUX
+ bool CompileAndProcessD3DShaderFXC(FString& PreprocessedShaderSource, const FString& CompilerPath,
+ 	uint32 CompileFlags, const FShaderCompilerInput& Input, FString& EntryPointName,
+ 	const TCHAR* ShaderProfile, bool bProcessingSecondTime,
+ 	TArray<FString>& FilteredErrors, FShaderCompilerOutput& Output);
++#endif
+ 
+ bool CompileAndProcessD3DShaderDXC(FString& PreprocessedShaderSource,
+ 	uint32 CompileFlags, const FShaderCompilerInput& Input, FString& EntryPointName,
+diff --git a/Engine/Source/Developer/Windows/ShaderFormatD3D/ShaderFormatD3D.Build.cs b/Engine/Source/Developer/Windows/ShaderFormatD3D/ShaderFormatD3D.Build.cs
+index 52704b128bab..cf992a816051 100644
+--- a/Engine/Source/Developer/Windows/ShaderFormatD3D/ShaderFormatD3D.Build.cs
++++ b/Engine/Source/Developer/Windows/ShaderFormatD3D/ShaderFormatD3D.Build.cs
+@@ -7,8 +7,11 @@ public class ShaderFormatD3D : ModuleRules
+ 	public ShaderFormatD3D(ReadOnlyTargetRules Target) : base(Target)
+ 	{
+ 		PrivateIncludePathModuleNames.Add("TargetPlatform");
+-		PrivateIncludePathModuleNames.Add("D3D11RHI");
+-		PrivateIncludePathModuleNames.Add("D3D12RHI");
++		if (Target.Platform == UnrealTargetPlatform.Win64)
++		{
++			PrivateIncludePathModuleNames.Add("D3D11RHI");
++			PrivateIncludePathModuleNames.Add("D3D12RHI");
++		}
+ 
+         PrivateIncludePaths.Add("../Shaders/Shared");
+ 
+@@ -32,10 +35,19 @@ public class ShaderFormatD3D : ModuleRules
+ 			RuntimeDependencies.Add(BinaryFolder + "/dxcompiler.dll");
+ 			RuntimeDependencies.Add(BinaryFolder + "/ShaderConductor.dll");
+ 
+-			AddEngineThirdPartyPrivateStaticDependencies(Target,
+-				"ShaderConductor"
+-			);
++			AddEngineThirdPartyPrivateStaticDependencies(Target, "ShaderConductor");
++			AddEngineThirdPartyPrivateStaticDependencies(Target, "DX11");
++		}
++		else if (Target.Platform == UnrealTargetPlatform.Linux)
++		{
++			// Linux cross-compilation: DXC-only mode (no FXC, no D3D SDK headers)
++			PublicDefinitions.Add("SHADERFORMAT_D3D_CROSS_COMPILE=1");
++
++			string BinaryFolder = Target.UEThirdPartyBinariesDirectory + "ShaderConductor/Linux/x86_64-unknown-linux-gnu";
++			RuntimeDependencies.Add(BinaryFolder + "/libdxcompiler.so");
++			RuntimeDependencies.Add(BinaryFolder + "/libShaderConductor.so");
++
++			AddEngineThirdPartyPrivateStaticDependencies(Target, "ShaderConductor");
+ 		}
+-		AddEngineThirdPartyPrivateStaticDependencies(Target, "DX11");
+ 	}
+ }
+diff --git a/Engine/Source/Developer/Windows/WindowsTargetPlatform/Private/GenericWindowsTargetPlatform.h b/Engine/Source/Developer/Windows/WindowsTargetPlatform/Private/GenericWindowsTargetPlatform.h
+index 9fa9cbd521fa..744efc1a8506 100644
+--- a/Engine/Source/Developer/Windows/WindowsTargetPlatform/Private/GenericWindowsTargetPlatform.h
++++ b/Engine/Source/Developer/Windows/WindowsTargetPlatform/Private/GenericWindowsTargetPlatform.h
+@@ -5,7 +5,10 @@
+ #include "CoreMinimal.h"
+ #include "Common/TargetPlatformBase.h"
+ #include "Misc/ConfigCacheIni.h"
++#include "Windows/WindowsPlatformProperties.h"
++#if PLATFORM_WINDOWS
+ #include "LocalPcTargetDevice.h"
++#endif
+ #include "Serialization/MemoryLayout.h"
+ 
+ #if WITH_ENGINE
+@@ -140,13 +143,18 @@ public:
+ 	}
+ 
+ 	virtual void GetShaderCompilerDependencies(TArray<FString>& OutDependencies) const override
+-	{		
++	{
++#if PLATFORM_WINDOWS
+ 		FTargetPlatformBase::AddDependencySCArrayHelper(OutDependencies, TEXT("Binaries/ThirdParty/Windows/DirectX/x64/d3dcompiler_47.dll"));
+ 		FTargetPlatformBase::AddDependencySCArrayHelper(OutDependencies, TEXT("Binaries/ThirdParty/Windows/DirectX/x64/dxil.dll"));
+ 		FTargetPlatformBase::AddDependencySCArrayHelper(OutDependencies, TEXT("Binaries/ThirdParty/ShaderConductor/Win64/ShaderConductor.dll"));
+ 		FTargetPlatformBase::AddDependencySCArrayHelper(OutDependencies, TEXT("Binaries/ThirdParty/ShaderConductor/Win64/dxcompiler.dll"));
+ 		FTargetPlatformBase::AddDependencySCArrayHelper(OutDependencies, TEXT("Binaries/Win64/dxcompiler.dll"));
+ 		FTargetPlatformBase::AddDependencySCArrayHelper(OutDependencies, TEXT("Binaries/Win64/dxil.dll"));
++#elif PLATFORM_LINUX
++		FTargetPlatformBase::AddDependencySCArrayHelper(OutDependencies, TEXT("Binaries/ThirdParty/ShaderConductor/Linux/x86_64-unknown-linux-gnu/libShaderConductor.so"));
++		FTargetPlatformBase::AddDependencySCArrayHelper(OutDependencies, TEXT("Binaries/ThirdParty/ShaderConductor/Linux/x86_64-unknown-linux-gnu/libdxcompiler.so"));
++#endif
+ 	}
+ 
+ 	virtual bool SupportsFeature( ETargetPlatformFeatures Feature ) const override
+diff --git a/Engine/Source/Editor/MainFrame/Private/Menus/MainMenu.cpp b/Engine/Source/Editor/MainFrame/Private/Menus/MainMenu.cpp
+index 91b7a1048b8e..45f09f513366 100644
+--- a/Engine/Source/Editor/MainFrame/Private/Menus/MainMenu.cpp
++++ b/Engine/Source/Editor/MainFrame/Private/Menus/MainMenu.cpp
+@@ -506,6 +506,27 @@ void FMainMenu::RegisterFileProjectMenu()
+ 				Action
+ 			);
+ 		}
++
++#if PLATFORM_LINUX
++		// Add Windows cook option when running on Linux
++		{
++			const FName WindowsPlatformName = TEXT("WindowsNoEditor");
++			const FText WindowsPlatformText = LOCTEXT("WindowsPlatformName", "Windows");
++
++			FUIAction WindowsAction(
++				FExecuteAction::CreateStatic(&FMainFrameActionCallbacks::CookContent, WindowsPlatformName),
++				FCanExecuteAction::CreateStatic(&FMainFrameActionCallbacks::CookContentCanExecute, WindowsPlatformName)
++			);
++
++			InSection.AddMenuEntry(
++				"CookContentForWindows",
++				FText::Format(LOCTEXT("CookContentForPlatform", "Cook Content for {0}"), WindowsPlatformText),
++				FText::Format(LOCTEXT("CookContentForPlatformTooltip", "Cook your game content for debugging on the {0} platform"), WindowsPlatformText),
++				FSlateIcon(),
++				WindowsAction
++			);
++		}
++#endif
+ 	}));
+ }
+ 
+diff --git a/Engine/Source/Programs/ShaderCompileWorker/ShaderCompileWorker.Build.cs b/Engine/Source/Programs/ShaderCompileWorker/ShaderCompileWorker.Build.cs
+index b536ef718cc8..d2f155f619e4 100644
+--- a/Engine/Source/Programs/ShaderCompileWorker/ShaderCompileWorker.Build.cs
++++ b/Engine/Source/Programs/ShaderCompileWorker/ShaderCompileWorker.Build.cs
+@@ -38,6 +38,16 @@ public class ShaderCompileWorker : ModuleRules
+ 		{
+ 			RuntimeDependencies.Add(EngineDir + "Binaries/ThirdParty/Windows/DirectX/x64/d3dcompiler_47.dll");
+ 		}
++		else if (Target.Platform == UnrealTargetPlatform.Linux)
++		{
++			// ShaderFormatD3D for cross-cooking Windows shaders on Linux
++			DynamicallyLoadedModuleNames.Add("ShaderFormatD3D");
++
++			// ShaderConductor DXC libraries
++			string BinaryFolder = EngineDir + "Binaries/ThirdParty/ShaderConductor/Linux/x86_64-unknown-linux-gnu";
++			RuntimeDependencies.Add(BinaryFolder + "/libdxcompiler.so");
++			RuntimeDependencies.Add(BinaryFolder + "/libShaderConductor.so");
++		}
+ 	}
+ }
+ 
+diff --git a/Engine/Source/Programs/UnrealBuildTool/Platform/Linux/UEBuildLinux.cs b/Engine/Source/Programs/UnrealBuildTool/Platform/Linux/UEBuildLinux.cs
+index d8b35ac02ab1..93002c0aecf8 100644
+--- a/Engine/Source/Programs/UnrealBuildTool/Platform/Linux/UEBuildLinux.cs
++++ b/Engine/Source/Programs/UnrealBuildTool/Platform/Linux/UEBuildLinux.cs
+@@ -438,6 +438,18 @@ namespace UnrealBuildTool
+ 				{
+ 					bBuildShaderFormats = true;
+ 				}
++
++				// Windows cross-cooking support for editor builds with developer tools
++				if (ModuleName == "Engine")
++				{
++					if (Target.bBuildDeveloperTools)
++					{
++						Rules.DynamicallyLoadedModuleNames.Add("WindowsTargetPlatform");
++						Rules.DynamicallyLoadedModuleNames.Add("WindowsNoEditorTargetPlatform");
++						Rules.DynamicallyLoadedModuleNames.Add("WindowsClientTargetPlatform");
++						Rules.DynamicallyLoadedModuleNames.Add("WindowsServerTargetPlatform");
++					}
++				}
+ 			}
+ 
+ 			// allow standalone tools to use target platform modules, without needing Engine
+@@ -453,6 +465,12 @@ namespace UnrealBuildTool
+ 					Rules.DynamicallyLoadedModuleNames.Add("LinuxServerTargetPlatform");
+ 					Rules.DynamicallyLoadedModuleNames.Add("LinuxAArch64ServerTargetPlatform");
+ 					Rules.DynamicallyLoadedModuleNames.Add("AllDesktopTargetPlatform");
++
++					// Windows cross-cooking support
++					Rules.DynamicallyLoadedModuleNames.Add("WindowsTargetPlatform");
++					Rules.DynamicallyLoadedModuleNames.Add("WindowsNoEditorTargetPlatform");
++					Rules.DynamicallyLoadedModuleNames.Add("WindowsClientTargetPlatform");
++					Rules.DynamicallyLoadedModuleNames.Add("WindowsServerTargetPlatform");
+ 				}
+ 
+ 				if (bBuildShaderFormats)
+@@ -460,6 +478,7 @@ namespace UnrealBuildTool
+ 					Rules.DynamicallyLoadedModuleNames.Add("ShaderFormatOpenGL");
+ 					Rules.DynamicallyLoadedModuleNames.Add("VulkanShaderFormat");
+ 					Rules.DynamicallyLoadedModuleNames.Add("ShaderFormatVectorVM");
++					Rules.DynamicallyLoadedModuleNames.Add("ShaderFormatD3D"); // Windows cross-cooking
+ 				}
+ 			}
+ 		}
+diff --git a/Engine/Source/ThirdParty/ShaderConductor/ShaderConductor.Build.cs b/Engine/Source/ThirdParty/ShaderConductor/ShaderConductor.Build.cs
+index c52f9e4cf1aa..58ddc087dd42 100644
+--- a/Engine/Source/ThirdParty/ShaderConductor/ShaderConductor.Build.cs
++++ b/Engine/Source/ThirdParty/ShaderConductor/ShaderConductor.Build.cs
+@@ -12,6 +12,12 @@ public class ShaderConductor : ModuleRules
+ 
+ 		PublicSystemIncludePaths.Add(Path.Combine(Target.UEThirdPartySourceDirectory, "ShaderConductor", "ShaderConductor", "Include"));
+ 
++		// Add DXC headers path for non-Windows platforms (Windows gets them from DX11 module)
++		if (Target.Platform != UnrealTargetPlatform.Win64 && Target.Platform != UnrealTargetPlatform.Win32)
++		{
++			PublicSystemIncludePaths.Add(Path.Combine(Target.UEThirdPartySourceDirectory, "ShaderConductor", "ShaderConductor", "External", "DirectXShaderCompiler", "include"));
++		}
++
+ 		if (Target.Platform == UnrealTargetPlatform.Mac)
+ 		{
+ 			string SCBinariesDir = Path.Combine(Target.UEThirdPartyBinariesDirectory, "ShaderConductor", "Mac");
+diff --git a/Engine/Source/ThirdParty/ShaderConductor/ShaderConductor/External/DirectXShaderCompiler/include/dxc/Support/WinAdapter.h b/Engine/Source/ThirdParty/ShaderConductor/ShaderConductor/External/DirectXShaderCompiler/include/dxc/Support/WinAdapter.h
+index dccac66f8565..1ab4acbf1446 100644
+--- a/Engine/Source/ThirdParty/ShaderConductor/ShaderConductor/External/DirectXShaderCompiler/include/dxc/Support/WinAdapter.h
++++ b/Engine/Source/ThirdParty/ShaderConductor/ShaderConductor/External/DirectXShaderCompiler/include/dxc/Support/WinAdapter.h
+@@ -53,16 +53,17 @@
+ 
+ #define _countof(a) (sizeof(a) / sizeof(*(a)))
+ 
+-// If it is GCC, there is no UUID support and we must emulate it.
++// Determine whether we need to emulate UUID support.
++// - Apple: always emulate
++// - GCC (non-clang): always emulate
++// - Clang: only emulate if -fms-extensions is not enabled (no __declspec(uuid) support)
+ #ifdef __APPLE__
+ #define __EMULATE_UUID 1
+-#else // __APPLE__
+-#ifdef __GNUC__
+-#ifndef __clang__
++#elif defined(__GNUC__) && !defined(__clang__)
+ #define __EMULATE_UUID 1
+-#endif // __GNUC__
+-#endif // __clang__
+-#endif // __APPLE__
++#elif defined(__clang__) && !__has_declspec_attribute(uuid)
++#define __EMULATE_UUID 1
++#endif
+ 
+ #ifdef __EMULATE_UUID
+ #define __declspec(x)
+@@ -228,14 +229,28 @@
+ 
+ //===--------------------- HRESULT Related Macros -------------------------===//
+ 
++#ifndef S_OK
+ #define S_OK ((HRESULT)0L)
++#endif
++#ifndef S_FALSE
+ #define S_FALSE ((HRESULT)1L)
++#endif
+ 
++#ifndef E_ABORT
+ #define E_ABORT (HRESULT)0x80004004
++#endif
++#ifndef E_ACCESSDENIED
+ #define E_ACCESSDENIED (HRESULT)0x80070005
++#endif
++#ifndef E_BOUNDS
+ #define E_BOUNDS  (HRESULT)0x8000000B
++#endif
++#ifndef E_FAIL
+ #define E_FAIL (HRESULT)0x80004005
++#endif
++#ifndef E_HANDLE
+ #define E_HANDLE (HRESULT)0x80070006
++#endif
+ #define E_INVALIDARG (HRESULT)0x80070057
+ #define E_NOINTERFACE (HRESULT)0x80004002
+ #define E_NOTIMPL (HRESULT)0x80004001
+@@ -414,7 +429,10 @@ typedef const void *LPCVOID;
+ 
+ typedef std::nullptr_t nullptr_t;
+ 
++#ifndef _HRESULT_DEFINED
++#define _HRESULT_DEFINED
+ typedef signed int HRESULT;
++#endif
+ 
+ //===--------------------- Handle Types -----------------------------------===//
+ 
+@@ -435,6 +453,8 @@ typedef void *HMODULE;
+ 
+ //===--------------------- ID Types and Macros for COM --------------------===//
+ 
++#ifndef _GUID_DEFINED
++#define _GUID_DEFINED
+ #ifdef __EMULATE_UUID
+ struct GUID
+ #else  // __EMULATE_UUID
+@@ -452,6 +472,7 @@ typedef struct _GUID
+ #else  // __EMULATE_UUID
+ GUID;
+ #endif // __EMULATE_UUID
++#endif // _GUID_DEFINED
+ typedef GUID CLSID;
+ typedef const GUID &REFGUID;
+ typedef const GUID &REFCLSID;
+-- 
+2.52.0
+
